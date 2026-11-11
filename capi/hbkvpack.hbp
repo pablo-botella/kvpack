@@ -1,0 +1,9 @@
+# hbkvpack.hbp — builds the Harbour wrapper as a static library (hbkvpack.lib / libhbkvpack.a).
+#   hbmk2 hbkvpack.hbp
+# Link it from a program's .hbp with: hbkvpack.hbl, or -lhbkvpack -L<this dir>
+-hblib
+-o${hb_name}
+-w3 -es2
+
+kvpack.c
+hbkvpack.c

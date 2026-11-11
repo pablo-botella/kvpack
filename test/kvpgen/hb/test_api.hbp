@@ -1,0 +1,11 @@
+# test_api.hbp - builds the test of the generated Harbour code as one executable.
+#   hbmk2 test_api.hbp
+-o${hb_name}
+-w3 -es2
+-gtcgi
+-i../../../capi
+
+test_api.prg
+api_kvp.prg
+../../../capi/kvpack.c
+../../../capi/hbkvpack.c

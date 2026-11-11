@@ -1,0 +1,30 @@
+# Test declaration: every type, lists, optional fields and records.
+command login = 1
+    user      text   = 1
+    password  text   = 2
+    when      ts     = 3   optional
+    tags      text   = 4   list
+
+reply login
+    name      text   = 1
+    expires   ts     = 2
+    level     int32  = 3   optional
+    events    event  = 4   list
+    owner     person = 5   optional
+
+command ping = 2
+
+record event = 100
+    id        int32  = 1
+    title     text   = 2
+    big       int64  = 3   optional
+    blob      bin    = 4   optional
+    raw       msg    = 5   optional
+    codes     int32  = 6   list
+    who       person = 7
+    active    bool   = 8   optional
+    score     float64 = 9  optional
+    day       ds     = 10  optional
+
+record person = 101
+    name      text   = 1

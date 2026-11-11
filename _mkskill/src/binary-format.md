@@ -1,0 +1,74 @@
+---
+mkskill:
+  pos: 80
+  in: readme
+---
+
+## Binary format
+
+All integers little-endian. Version 1.
+
+```
+HEADER (20 bytes)
+  0   magic     "KVP"
+  3   version   uint8   1
+  4   command   uint32  application command number
+  8   nitems    uint32  number of items in DATA
+  12  size      uint32  byte length of DATA
+  16  crc32     uint32  crc32 (IEEE 802.3, the one of zlib/Go/mskblob) of DATA
+
+DATA (size bytes): nitems items, back to back, no padding
+  key       uint16  application key; 0 is reserved for an error text
+  type      uint16  1 int32, 2 int64, 3 ts, 4 text, 5 bin, 6 msg,
+                    7 bool, 8 float64, 9 ds
+  size      uint32  byte length of value
+  value     size bytes
+```
+
+| type | value |
+|---|---|
+| `int32` (1) | 4 bytes, signed |
+| `int64` (2) | 8 bytes, signed |
+| `ts` (3) | 8 bytes, signed: Unix seconds, UTC (`time_t`, `time.Unix`) |
+| `text` (4) | UTF-8, no terminator |
+| `bin` (5) | raw bytes |
+| `msg` (6) | a whole message, header included; its `command` says what kind of record it is |
+| `bool` (7) | 1 byte: 0 or 1 |
+| `float64` (8) | 8 bytes, IEEE 754 |
+| `ds` (9) | 8 ASCII digits `yyyymmdd`, a calendar day as Harbour's `DToS()` writes it; 8 spaces are the null date (`DToS()` of an empty date). As with `SToD()`, a reader takes anything that is not a real day (`00000000`, `20260230`) as the null date |
+
+Rules a decoder enforces: the exact total length is header + `size`;
+the crc32 matches; `nitems` items fit in `size` and consume it exactly;
+every type is known and the fixed-size ones (`int32`, `int64`, `ts`,
+`bool`, `float64`, `ds`) carry their size; a `bool` is 0 or 1; a `msg`
+value decodes by the same rules. Anything else is rejected before
+any value is handed out. A key may repeat; readers take the first unless
+they ask for all.
+
+The canonical message pinned in the three test suites — command 7 with an
+`int32` −2, an `int64` 1234567890123, a `ts` 1700000000, the text `héllo`
+and the bytes `00 ff 10` under keys 1..5 — is 89 bytes:
+
+```
+4b565001 07000000 05000000 45000000 a1233148     header: "KVP"1, cmd 7, 5 items, 69 bytes, crc
+0100 0100 04000000 feffffff                       key 1 int32 -2
+0200 0200 08000000 cb04fb711f010000               key 2 int64 1234567890123
+0300 0300 08000000 00f1536500000000               key 3 ts 1700000000
+0400 0400 06000000 68c3a96c6c6f                   key 4 text "héllo"
+0500 0500 03000000 00ff10                         key 5 bin
+```
+
+A second one pins the later types — command 8 with a `bool` true, a `bool`
+false, a `float64` 1.5, the `ds` 2026-11-11 and the null `ds` — in 86 bytes:
+
+```
+4b565001 08000000 05000000 42000000 9000fc76     header: "KVP"1, cmd 8, 5 items, 66 bytes, crc
+0100 0700 01000000 01                             key 1 bool true
+0200 0700 01000000 00                             key 2 bool false
+0300 0800 08000000 000000000000f83f               key 3 float64 1.5
+0400 0900 08000000 3230323631313131               key 4 ds "20261111"
+0500 0900 08000000 2020202020202020               key 5 ds null (8 spaces)
+```
+
+---
+

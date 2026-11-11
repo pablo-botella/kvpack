@@ -1,0 +1,9 @@
+# test_hbkvpack.hbp — builds the wrapper test as one executable, sources included.
+#   hbmk2 test_hbkvpack.hbp
+-o${hb_name}
+-w3 -es2
+-gtcgi
+
+test_hbkvpack.prg
+kvpack.c
+hbkvpack.c
