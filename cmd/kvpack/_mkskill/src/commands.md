@@ -17,11 +17,11 @@ mkskill:
 
 | Flag | Description |
 |---|---|
-| `-go file` | Go code, package `-pkg` |
-| `-pkg name` | Go package name (default: the `.kvp` base name) |
-| `-c file.h` | C header, and the `.c` of the same name next to it |
-| `-hb file.prg` | Harbour classes, and the `.ch` of the same name next to them |
-| `-prefix p` | Prefix of the C and Harbour names (default: the `.kvp` base name) |
+| `-go file` | Go code, package `-pkg`, and next to it `<package>_handler-go.txt`, the skeleton of the handler of the server side |
+| `-pkg name` | Go package name (default: the one a `names` section of the `.kvp` gives, then its service, then its base name) |
+| `-c file.h` | C header, and the `.c` of the same name next to it, and `<prefix>_handler-c.txt`, the skeleton of the handler |
+| `-hb file.prg` | Harbour classes, the `.ch` of the same name next to them, and `<prefix>_handler-prg.txt`: the skeleton of the handler of the server side, to copy and fill |
+| `-prefix p` | Prefix of the C and Harbour names (default: the one a `names` section of the `.kvp` gives, then its service, then its base name) |
 
 A file whose content would not change is not rewritten, so builds that
 look at timestamps stay quiet.

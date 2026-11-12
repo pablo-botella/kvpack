@@ -139,7 +139,8 @@ typedef enum {
     KVP_E_NOT_FOUND = -8,      /* no item with that key, or end of the walk */
     KVP_E_TYPE      = -9,      /* the item is not of the requested type */
     KVP_E_MISSING   = -10,     /* generated code: a required field is missing */
-    KVP_E_REPLY     = -11      /* generated code: the reply is an error reply */
+    KVP_E_REPLY     = -11,     /* generated code: the reply is an error reply */
+    KVP_E_CALL      = -12      /* generated code: the transport of a call failed */
 } kvp_error;
 
 /* Text and bytes by reference: p points into a received message (or, when

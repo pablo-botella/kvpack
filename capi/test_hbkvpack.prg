@@ -46,6 +46,7 @@ PROCEDURE Main()
    ELSE
       ? "kvpack Harbour: all good"
    ENDIF
+   ?
    RETURN
 
 STATIC PROCEDURE TestCanonical2()

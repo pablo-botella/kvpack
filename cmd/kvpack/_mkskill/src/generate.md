@@ -24,6 +24,16 @@ goes as its empty value, the same bytes in the three languages; an
 and reads null when absent; unknown keys are ignored. Single fields are
 written first and lists after them, so the three produce the same bytes.
 
+A declaration with commands gives more than its types, in the same files:
+a **multiplexer** for the side that serves (it finds the command of a
+message, unpacks the request and calls the application's handler,
+`On<Command>`) and a **call per command** for the side that asks (it packs
+the request, hands it to whatever carries it and unpacks the reply).
+Neither has a transport in it. Next to the code goes the skeleton of the
+handler, to copy and fill: `<package>_handler-go.txt`,
+`<prefix>_handler-c.txt` and `<prefix>_handler-prg.txt`; it is written again
+on every run and is no part of the build.
+
 The C code is built on `kvp_arena.h` (with `dyn_buffer.h` under it), next
 to `kvpack.h` in `capi/`: compile `kvpack.c`, `dyn_buffer.c` and
 `kvp_arena.c` with the generated `.c`.

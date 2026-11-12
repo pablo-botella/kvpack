@@ -5,6 +5,7 @@
  *   hbmk2 test_api.hbp
  * Exit code 0 when all good; each failure prints its line.
  */
+#include "hbclass.ch"
 #include "kvpack.ch"
 #include "api_kvp.ch"
 
@@ -38,12 +39,15 @@ PROCEDURE Main()
    TestEveryWrite()
    TestEveryRead()
    TestEveryKeyByKey()
+   TestServer()
+   TestClient()
    IF s_nFail > 0
       ? s_nFail, "failure(s)"
       ErrorLevel( 1 )
    ELSE
       ? "kvpack generated Harbour: all good"
    ENDIF
+   ?
    RETURN
 
 STATIC FUNCTION Person( cName )
@@ -659,4 +663,188 @@ STATIC PROCEDURE TestEveryKeyByKey()
       NEXT
    NEXT
    CHECK nBad == 0
+   RETURN
+
+/* --- the server side ---------------------------------------------------------
+ * The multiplexer generated from api.kvp (ApiServer), with no transport: a
+ * handler of the application, the message it gets for each call, and a
+ * context the multiplexer only passes on. Here the context is a hash where
+ * the handler leaves the bytes of what it replies.
+ */
+CREATE CLASS TestHandler
+
+   VAR nCalls INIT 0
+
+   METHOD OnLogin( oMsg, oCtx )
+   METHOD OnPing( oMsg, oCtx )
+   METHOD OnQuery( oMsg, oCtx )
+   METHOD OnEvery( oMsg, oCtx )
+
+ENDCLASS
+
+METHOD OnLogin( oMsg, oCtx ) CLASS TestHandler
+
+   ::nCalls++
+   oCtx[ "class" ] := oMsg:ClassName()
+   IF oMsg:request:password == "secret"
+      oMsg:reply:name := Upper( oMsg:request:user )      // the reply is there, empty: just fill it
+      oMsg:reply:expires := 1700000000
+      oCtx[ "reply" ] := oMsg:Encode()
+   ELSE
+      oCtx[ "reply" ] := KvpEncode( oMsg:PackError( "wrong password" ) )
+   ENDIF
+
+   RETURN NIL
+
+METHOD OnPing( oMsg, oCtx ) CLASS TestHandler
+
+   ::nCalls++
+   oCtx[ "reply" ] := iif( oMsg:reply == NIL, oMsg:Encode(), "ping has a reply?" )
+
+   RETURN NIL
+
+METHOD OnQuery( oMsg, oCtx ) CLASS TestHandler
+
+   ::nCalls++
+   oMsg:reply:code := Len( oMsg:request:sql )
+   oMsg:reply:rows:AddField( "n", KVP_INT32 )            // a new reply has its tupleset ready
+   oMsg:reply:rows:AddRow( { 1 } )
+   oCtx[ "reply" ] := oMsg:Encode()
+
+   RETURN NIL
+
+METHOD OnEvery( oMsg, oCtx ) CLASS TestHandler
+
+   ::nCalls++
+   oCtx[ "reply" ] := oMsg:request:r_text                // nothing says a handler must reply a message
+
+   RETURN NIL
+
+/* A message class of the application's own, put in the place of the generated one. */
+CREATE CLASS MyLoginMsg INHERIT ApiLoginMsg
+ENDCLASS
+
+STATIC FUNCTION Call( oSrv, oReq, hCtx, nErr )
+   RETURN oSrv:Dispatch( KvpParse( oReq:Encode() ), hCtx, @nErr )
+
+STATIC PROCEDURE TestServer()
+   LOCAL oH := TestHandler():New(), oSrv := ApiServer():New( oH ), hCtx := { => }
+   LOCAL nErr, oReq, oRep, hMsg
+
+   /* a call: the request is unpacked into the message, the handler fills the reply */
+   oReq := ApiLogin():New()
+   oReq:user     := "bob"
+   oReq:password := "secret"
+   CHECK Call( oSrv, oReq, hCtx, @nErr ) .AND. nErr == KVP_OK .AND. oH:nCalls == 1
+   CHECK hCtx[ "class" ] == "APILOGINMSG"
+   oRep := ApiLoginReply():New()
+   CHECK oRep:Decode( hCtx[ "reply" ], @nErr ) .AND. oRep:name == "BOB" .AND. oRep:expires == 1700000000
+   CHECK Len( oRep:events ) == 0 .AND. oRep:owner == NIL            // what the handler did not touch is empty
+
+   /* an error reply is the handler's to send */
+   oReq:password := "no"
+   CHECK Call( oSrv, oReq, hCtx, @nErr ) .AND. nErr == KVP_OK
+   CHECK ! oRep:Decode( hCtx[ "reply" ], @nErr ) .AND. nErr == KVP_E_REPLY
+   CHECK KvpErrorText( KvpParse( hCtx[ "reply" ] ) ) == "wrong password"
+
+   /* a command with no reply: an empty message of its number */
+   CHECK Call( oSrv, ApiHeartbeat():New(), hCtx, @nErr ) .AND. nErr == KVP_OK    // the request of ping, as the declaration names it
+   hMsg := KvpParse( hCtx[ "reply" ] )
+   CHECK hMsg != NIL .AND. KvpCommand( hMsg ) == API_CMD_PING .AND. KvpCount( hMsg ) == 0
+
+   /* a reply with a tupleset */
+   oReq := ApiQuery():New()
+   oReq:sql := "select"
+   CHECK Call( oSrv, oReq, hCtx, @nErr ) .AND. nErr == KVP_OK
+   oRep := ApiQueryReply():New()
+   CHECK oRep:Decode( hCtx[ "reply" ], @nErr ) .AND. oRep:code == 6 .AND. Len( oRep:rows:aRows ) == 1 .AND. oRep:rows:aRows[ 1 ][ 1 ] == 1
+
+   /* the context is the caller's: the handler may leave anything in it */
+   oReq := ApiEvery():New()
+   oReq:r_text := "as it came"
+   CHECK Call( oSrv, oReq, hCtx, @nErr ) .AND. hCtx[ "reply" ] == "as it came"
+   CHECK oH:nCalls == 5
+
+   /* a command that is none of the service: nobody is called */
+   CHECK ! oSrv:Dispatch( KvpParse( KvpEncode( KvpNew( 99 ) ) ), hCtx, @nErr ) .AND. nErr == KVP_E_NOT_FOUND
+   /* a request with a required field missing: nobody is called either */
+   hMsg := KvpNew( API_CMD_LOGIN )
+   KvpAddText( hMsg, API_LOGIN_USER, "bob" )
+   CHECK ! oSrv:Dispatch( KvpParse( KvpEncode( hMsg ) ), hCtx, @nErr ) .AND. nErr == KVP_E_MISSING
+   CHECK oH:nCalls == 5
+
+   /* the message of a command is created from the class function in the
+      multiplexer: the application may put its own there */
+   oSrv:login := @MyLoginMsg()
+   oReq := ApiLogin():New()
+   oReq:user     := "ann"
+   oReq:password := "secret"
+   CHECK Call( oSrv, oReq, hCtx, @nErr ) .AND. hCtx[ "class" ] == "MYLOGINMSG"
+   oRep := ApiLoginReply():New()
+   CHECK oRep:Decode( hCtx[ "reply" ], @nErr ) .AND. oRep:name == "ANN"
+   RETURN
+
+/* --- the client side ---------------------------------------------------------
+ * The client generated from api.kvp (ApiClient), over a transport that is
+ * none: it hands the request straight to the multiplexer, in memory, so the
+ * two generated sides run against each other.
+ */
+CREATE CLASS LoopTransport
+
+   VAR oSrv
+   VAR lDown INIT .F.
+
+   METHOD Call( cRequest, nErr )
+
+ENDCLASS
+
+METHOD Call( cRequest, nErr ) CLASS LoopTransport
+
+   LOCAL hCtx := { => }
+
+   IF ::lDown
+      RETURN NIL                                       // could not, and says no more
+   ENDIF
+   IF ! ::oSrv:Dispatch( KvpParse( cRequest ), hCtx, @nErr )
+      RETURN NIL
+   ENDIF
+
+   RETURN hCtx[ "reply" ]
+
+STATIC PROCEDURE TestClient()
+   LOCAL oH := TestHandler():New(), oT := LoopTransport():New(), oCli, oReq, oRep, nErr
+
+   oT:oSrv := ApiServer():New( oH )
+   oCli := ApiClient():New( oT )
+
+   /* a call: the request out, the reply back, both as objects */
+   oReq := ApiLogin():New()
+   oReq:user     := "bob"
+   oReq:password := "secret"
+   oRep := oCli:Login( oReq, @nErr )
+   CHECK oRep != NIL .AND. nErr == KVP_OK .AND. oRep:ClassName() == "APILOGINREPLY"
+   CHECK oRep != NIL .AND. oRep:name == "BOB" .AND. oRep:expires == 1700000000
+
+   /* an error reply: no object, and the server's text */
+   oReq:password := "no"
+   CHECK oCli:Login( oReq, @nErr ) == NIL .AND. nErr == KVP_E_REPLY .AND. oCli:cError == "wrong password"
+
+   /* a command with no reply says .T. or .F. */
+   CHECK oCli:Ping( ApiHeartbeat():New(), @nErr ) == .T. .AND. nErr == KVP_OK .AND. oCli:cError == ""
+
+   /* a reply with a tupleset */
+   oReq := ApiQuery():New()
+   oReq:sql := "select"
+   oRep := oCli:Query( oReq, @nErr )
+   CHECK oRep != NIL .AND. oRep:code == 6 .AND. Len( oRep:rows:aRows ) == 1
+
+   /* a reply that is no message: the handler of every leaves plain text */
+   CHECK oCli:Every( ApiEvery():New(), @nErr ) == .F. .AND. nErr != KVP_OK
+
+   /* the transport could not: its own error, or KVP_E_CALL when it gives none */
+   oReq := ApiLogin():New()                            // no password: the multiplexer refuses it
+   oReq:password := NIL
+   oT:lDown := .T.
+   CHECK oCli:Login( oReq, @nErr ) == NIL .AND. nErr == KVP_E_CALL
+   CHECK oH:nCalls == 5
    RETURN

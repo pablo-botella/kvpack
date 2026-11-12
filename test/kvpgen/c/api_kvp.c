@@ -335,37 +335,37 @@ int api_login_reply_events(const kvp_buffer *b, const api_login_reply *s, kvp_it
     }
 }
 
-void api_ping_put(kvp_out *o, const kvp_buffer *a, const api_ping *s)
+void api_heartbeat_put(kvp_out *o, const kvp_buffer *a, const api_heartbeat *s)
 {
     (void)o;
     (void)a;
     (void)s;
 }
 
-size_t api_ping_size(const api_ping *s, const kvp_buffer *a)
+size_t api_heartbeat_size(const api_heartbeat *s, const kvp_buffer *a)
 {
     kvp_out o;
     kvp_out_measure(&o);
-    api_ping_put(&o, a, s);
+    api_heartbeat_put(&o, a, s);
     return o.size;
 }
 
-int api_ping_encode(const api_ping *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+int api_heartbeat_encode(const api_heartbeat *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
 {
     kvp_out o;
     kvp_out_begin(&o, buf, cap, API_CMD_PING);
-    api_ping_put(&o, a, s);
+    api_heartbeat_put(&o, a, s);
     return kvp_out_end(&o, len);
 }
 
-int api_ping_read(const kvp_buffer *b, const kvp_message *m, api_ping *s)
+int api_heartbeat_read(const kvp_buffer *b, const kvp_message *m, api_heartbeat *s)
 {
     memset(s, 0, sizeof *s);
     kvp_span_of(b, m, &s->kvp);
     return KVP_OK;
 }
 
-int api_ping_decode(const kvp_buffer *b, api_ping *s)
+int api_heartbeat_decode(const kvp_buffer *b, api_heartbeat *s)
 {
     kvp_message m;
     int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
@@ -373,7 +373,7 @@ int api_ping_decode(const kvp_buffer *b, api_ping *s)
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_ping_read(b, &m, s);
+    return api_heartbeat_read(b, &m, s);
 }
 
 void api_query_put(kvp_out *o, const kvp_buffer *a, const api_query *s)
@@ -965,4 +965,180 @@ int api_every_l_rec(const kvp_buffer *b, const api_every *s, kvp_item *it, api_p
         if (kvp_msg(it, &sub) == KVP_OK)
             return api_person_read(b, &sub, v);
     }
+}
+
+static int api_dispatch_login(const api_handler *h, void *app, const kvp_buffer *b, const kvp_message *m, void *ctx)
+{
+    api_login_msg msg;
+    int rc;
+    if (!h->on_login)
+        return KVP_E_NOT_FOUND;
+    memset(&msg, 0, sizeof msg);
+    msg.b = b;
+    rc = api_login_read(b, m, &msg.request);
+    if (rc != KVP_OK)
+        return rc;
+    h->on_login(app, &msg, ctx);
+    return KVP_OK;
+}
+
+static int api_dispatch_ping(const api_handler *h, void *app, const kvp_buffer *b, const kvp_message *m, void *ctx)
+{
+    api_ping_msg msg;
+    int rc;
+    if (!h->on_ping)
+        return KVP_E_NOT_FOUND;
+    memset(&msg, 0, sizeof msg);
+    msg.b = b;
+    rc = api_heartbeat_read(b, m, &msg.request);
+    if (rc != KVP_OK)
+        return rc;
+    h->on_ping(app, &msg, ctx);
+    return KVP_OK;
+}
+
+static int api_dispatch_query(const api_handler *h, void *app, const kvp_buffer *b, const kvp_message *m, void *ctx)
+{
+    api_query_msg msg;
+    int rc;
+    if (!h->on_query)
+        return KVP_E_NOT_FOUND;
+    memset(&msg, 0, sizeof msg);
+    msg.b = b;
+    rc = api_query_read(b, m, &msg.request);
+    if (rc != KVP_OK)
+        return rc;
+    h->on_query(app, &msg, ctx);
+    return KVP_OK;
+}
+
+static int api_dispatch_every(const api_handler *h, void *app, const kvp_buffer *b, const kvp_message *m, void *ctx)
+{
+    api_every_msg msg;
+    int rc;
+    if (!h->on_every)
+        return KVP_E_NOT_FOUND;
+    memset(&msg, 0, sizeof msg);
+    msg.b = b;
+    rc = api_every_read(b, m, &msg.request);
+    if (rc != KVP_OK)
+        return rc;
+    h->on_every(app, &msg, ctx);
+    return KVP_OK;
+}
+
+int api_dispatch(const api_handler *h, void *app, const kvp_buffer *b, void *ctx)
+{
+    kvp_message m;
+    int rc;
+    if (!h || !b)
+        return KVP_E_ARGUMENT;
+    rc = kvp_parse(b->data, b->size, &m);
+    if (rc != KVP_OK)
+        return rc;
+    switch (m.command) {
+    case API_CMD_LOGIN:
+        return api_dispatch_login(h, app, b, &m, ctx);
+    case API_CMD_PING:
+        return api_dispatch_ping(h, app, b, &m, ctx);
+    case API_CMD_QUERY:
+        return api_dispatch_query(h, app, b, &m, ctx);
+    case API_CMD_EVERY:
+        return api_dispatch_every(h, app, b, &m, ctx);
+    default:
+        break;
+    }
+    return KVP_E_NOT_FOUND;
+}
+
+int api_call_login(const api_client *c, const api_login *req, const kvp_buffer *a, kvp_buffer *io, api_login_reply *reply)
+{
+    size_t n, len = 0;
+    uint8_t *p;
+    int rc;
+    if (!c || !c->call || !req || !io || !reply)
+        return KVP_E_ARGUMENT;
+    n = api_login_size(req, a);
+    io->size = 0;
+    p = kvp_buffer_lock_bytes(io, n);
+    if (!p)
+        return KVP_E_FULL;
+    rc = api_login_encode(req, a, p, n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_buffer_unlock_bytes(io, len);
+    if (c->call(c->transport, io) != 0)
+        return KVP_E_CALL;
+    return api_login_reply_decode(io, reply);
+}
+
+int api_call_ping(const api_client *c, const api_heartbeat *req, const kvp_buffer *a, kvp_buffer *io)
+{
+    kvp_message m;
+    size_t n, len = 0;
+    uint8_t *p;
+    int rc;
+    if (!c || !c->call || !req || !io)
+        return KVP_E_ARGUMENT;
+    n = api_heartbeat_size(req, a);
+    io->size = 0;
+    p = kvp_buffer_lock_bytes(io, n);
+    if (!p)
+        return KVP_E_FULL;
+    rc = api_heartbeat_encode(req, a, p, n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_buffer_unlock_bytes(io, len);
+    if (c->call(c->transport, io) != 0)
+        return KVP_E_CALL;
+    rc = kvp_parse(io->data, io->size, &m);
+    if (rc != KVP_OK)
+        return rc;
+    return kvp_is_error(&m) ? KVP_E_REPLY : KVP_OK;
+}
+
+int api_call_query(const api_client *c, const api_query *req, const kvp_buffer *a, kvp_buffer *io, api_query_reply *reply)
+{
+    size_t n, len = 0;
+    uint8_t *p;
+    int rc;
+    if (!c || !c->call || !req || !io || !reply)
+        return KVP_E_ARGUMENT;
+    n = api_query_size(req, a);
+    io->size = 0;
+    p = kvp_buffer_lock_bytes(io, n);
+    if (!p)
+        return KVP_E_FULL;
+    rc = api_query_encode(req, a, p, n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_buffer_unlock_bytes(io, len);
+    if (c->call(c->transport, io) != 0)
+        return KVP_E_CALL;
+    return api_query_reply_decode(io, reply);
+}
+
+int api_call_every(const api_client *c, const api_every *req, const kvp_buffer *a, kvp_buffer *io)
+{
+    kvp_message m;
+    size_t n, len = 0;
+    uint8_t *p;
+    int rc;
+    if (!c || !c->call || !req || !io)
+        return KVP_E_ARGUMENT;
+    n = api_every_size(req, a);
+    io->size = 0;
+    p = kvp_buffer_lock_bytes(io, n);
+    if (!p)
+        return KVP_E_FULL;
+    rc = api_every_encode(req, a, p, n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_buffer_unlock_bytes(io, len);
+    if (c->call(c->transport, io) != 0)
+        return KVP_E_CALL;
+    rc = kvp_parse(io->data, io->size, &m);
+    if (rc != KVP_OK)
+        return rc;
+    return kvp_is_error(&m) ? KVP_E_REPLY : KVP_OK;
 }

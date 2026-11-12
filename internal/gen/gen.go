@@ -53,6 +53,37 @@ func packOrder(b *schema.Block) []*schema.Field {
 	return append(single, lists...)
 }
 
+// names holds the name of the type of every block in one language, in
+// lowercase with _: the one the declaration gives it, or prefix and the
+// block's own name.
+type names map[*schema.Block]string
+
+// typeNames names the types of a declaration for lang. prefix goes before
+// the name of a type the declaration does not name; "" for none. Two types
+// that end up with one name are an error.
+func typeNames(f *schema.File, lang, prefix string) (names, error) {
+	tn := names{}
+	seen := map[string]*schema.Block{}
+	for _, b := range f.Blocks {
+		n := f.TypeName(lang, b)
+		if n == "" {
+			n = blockName(b)
+			if prefix != "" {
+				n = prefix + "_" + n
+			}
+		}
+		if o := seen[n]; o != nil {
+			return nil, fmt.Errorf("%s:%d: %s %s and %s %s are both named %s in %s", b.File, b.Line, o.Kind, o.Name, b.Kind, b.Name, n, lang)
+		}
+		seen[n] = b
+		tn[b] = n
+	}
+	return tn, nil
+}
+
+// camel is the name of a block's type in CamelCase.
+func (tn names) camel(b *schema.Block) string { return camel(tn[b]) }
+
 // holdsItself refuses a record that reaches itself through fields that
 // always travel (anything but an optional field or a list): its empty value
 // would hold another one, and so on without end.

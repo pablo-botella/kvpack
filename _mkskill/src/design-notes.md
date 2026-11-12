@@ -92,6 +92,22 @@ allocates nothing.
 are proven to, byte for byte, on a message that exercises every type; the
 Go test, the C test and the Harbour test all pin the same 89 bytes.
 
+**Why the generated server and client carry no transport.** A multiplexer
+that takes a message and calls a function, and a call that packs a request
+and unpacks a reply, are the same whatever brings the bytes: HTTP, a pipe,
+a test that joins the two in memory. Keeping the transport out lets every
+language have both sides, and lets each be tested without a network. The
+multiplexer stops at calling the handler, and does not send the reply
+itself, for the same reason: how a reply travels, and whether it is one
+message, several or none, is for the handler and the context it was given.
+
+**Why a service has a name and no number.** The service is a way of
+grouping the commands of a declaration and of naming what is generated
+from it; it is not part of a message. Which call goes where when a server
+offers several is decided by whoever receives it, with what the transport
+knows (a path, a header, who is asking), and that is not the format's
+business. A number in the message would have made it so.
+
 **What is deliberately out.** Transport (a message is bytes; `Read`/`WriteTo`
 work over any stream), schemas, compression, encryption
 (TLS is the transport's), and names for keys and commands on the wire. The

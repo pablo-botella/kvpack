@@ -9,8 +9,12 @@
 //	kvpack version
 //
 // -c writes the header and, next to it, the .c of the same name; -hb writes
-// the .prg and the .ch of the same name. -prefix starts the C and Harbour
-// names and -pkg is the Go package; both default to the .kvp file name.
+// the .prg and the .ch of the same name. Each also writes the skeleton of
+// the handler of the server side, to copy and fill: <package>_handler-go.txt,
+// <prefix>_handler-c.txt and <prefix>_handler-prg.txt. -prefix starts the C and Harbour
+// names and -pkg is the Go package; both default to what the .kvp proposes
+// in a names section, then to the service it declares, then to its file
+// name.
 // validate applies the rules of the generated code to one message and
 // prints it with the declared names.
 package main
@@ -39,11 +43,16 @@ usage:
   kvpack version
 
 gen flags:
-  -go file      write Go code (package -pkg)
-  -pkg name     Go package name (default: the .kvp base name)
-  -c file.h     write a C header and, next to it, the .c of the same name
-  -hb file.prg  write Harbour functions and, next to them, the .ch of the same name
-  -prefix p     prefix of C and Harbour names (default: the .kvp base name)
+  -go file      write Go code (package -pkg) and, next to it, <package>_handler-go.txt
+  -pkg name     Go package name (default: what the .kvp names, its service, or its base name)
+  -c file.h     write a C header and, next to it, the .c of the same name and
+                <prefix>_handler-c.txt
+  -hb file.prg  write Harbour classes and, next to them, the .ch of the same name
+                and <prefix>_handler-prg.txt
+
+The _handler-*.txt files are the skeleton of the handler of the server side:
+code to copy and fill, written again on every run.
+  -prefix p     prefix of C and Harbour names (default: what the .kvp names, its service, or its base name)
 
 validate reads the message as the command (or record) its number names, or
 as that command's reply with -reply, and fails when a generated decoder
@@ -139,11 +148,24 @@ func generate(args []string) error {
 		return err
 	}
 	base := defaultName(src)
-	if *pkg == "" {
-		*pkg = base
+	if f.Service != "" { // the names start from the service, when there is one
+		base = f.Service
 	}
-	if *prefix == "" {
-		*prefix = base
+	// a name given here wins; then the one the declaration proposes in a
+	// names section; then the service, or the file name
+	if *pkg == "" {
+		if *pkg = f.Package(); *pkg == "" {
+			*pkg = base
+		}
+	}
+	prefixOf := func(lang string) string {
+		if *prefix != "" {
+			return *prefix
+		}
+		if p := f.Prefix(lang); p != "" {
+			return p
+		}
+		return base
 	}
 	if *goOut != "" {
 		b, err := gen.Go(f, *pkg)
@@ -153,9 +175,18 @@ func generate(args []string) error {
 		if err := write(*goOut, b); err != nil {
 			return err
 		}
+		skel, err := gen.GoHandler(f, *pkg)
+		if err != nil {
+			return err
+		}
+		if skel != nil {
+			if err := write(filepath.Join(filepath.Dir(*goOut), *pkg+"_handler-go.txt"), skel); err != nil {
+				return err
+			}
+		}
 	}
 	if *cOut != "" {
-		h, c, err := gen.C(f, *prefix, *cOut)
+		h, c, err := gen.C(f, prefixOf(schema.C), *cOut)
 		if err != nil {
 			return err
 		}
@@ -165,10 +196,19 @@ func generate(args []string) error {
 		if err := write(swapExt(*cOut, ".c"), c); err != nil {
 			return err
 		}
+		skel, err := gen.CHandler(f, prefixOf(schema.C), *cOut)
+		if err != nil {
+			return err
+		}
+		if skel != nil {
+			if err := write(filepath.Join(filepath.Dir(*cOut), prefixOf(schema.C)+"_handler-c.txt"), skel); err != nil {
+				return err
+			}
+		}
 	}
 	if *hbOut != "" {
 		ch := swapExt(*hbOut, ".ch")
-		chb, prg, err := gen.Harbour(f, *prefix, ch)
+		chb, prg, err := gen.Harbour(f, prefixOf(schema.Harbour), ch)
 		if err != nil {
 			return err
 		}
@@ -178,17 +218,23 @@ func generate(args []string) error {
 		if err := write(*hbOut, prg); err != nil {
 			return err
 		}
+		// the skeleton of the handler, next to the code and named after
+		// the prefix: sqlbk_handler-prg.txt
+		skel, err := gen.HarbourHandler(f, prefixOf(schema.Harbour), ch)
+		if err != nil {
+			return err
+		}
+		if skel != nil {
+			if err := write(filepath.Join(filepath.Dir(*hbOut), prefixOf(schema.Harbour)+"_handler-prg.txt"), skel); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 func load(path string) (*schema.File, error) {
-	fh, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer fh.Close()
-	return schema.Parse(path, fh)
+	return schema.ParseFile(path)
 }
 
 // defaultName is the .kvp base name as an identifier: "my-api.kvp" -> "my_api".

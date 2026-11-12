@@ -27,6 +27,43 @@
  * anywhere else it is written as the empty value.
  */
 
+/*
+ * The server side, with no transport in it. Three pieces:
+ *   the handler   an object of the application with a method On<Command> per
+ *                 command: OnLogin( oMsg, oCtx ). It is given to the
+ *                 multiplexer
+ *   the message   oMsg, created by the multiplexer for each call from the
+ *                 class of its command:
+ *                   oMsg:request   the request, unpacked
+ *                   oMsg:reply     the reply, new and empty, to fill (NIL
+ *                                  when the command declares no reply)
+ *                   oMsg:Pack()    the reply as a message; oMsg:Encode() its
+ *                                  bytes; oMsg:PackError( cText ) an error
+ *                                  reply instead
+ *   the context   oCtx, whatever the caller of Dispatch gives for the call:
+ *                 the multiplexer passes it on and never looks at it
+ *
+ *   oSrv := <Service>():New( oHandler )
+ *   lOk  := oSrv:Dispatch( hMsg, oCtx, @nErr )   hMsg a parsed message
+ *
+ * Dispatch creates the message of the command, unpacks the request into it
+ * and calls the handler; that is all it does. What is replied, and how it
+ * reaches the caller, is the handler's, with oMsg and oCtx. It says .F. and
+ * calls nobody when the command is none of the service (KVP_E_NOT_FOUND) or
+ * the request misses a required field (KVP_E_MISSING).
+ *
+ * The client side, with no transport in it either:
+ *   oCli := <Client>():New( oTransport )
+ *   oReply := oCli:Login( oReq, @nErr )   an object of the reply's class, or
+ *                                         NIL with nErr set; a command that
+ *                                         declares no reply gives .T. or .F.
+ * oTransport is any object with a method Call( cRequest, @nErr ) that sends
+ * the bytes of a request and returns those of the reply, or NIL when it
+ * could not (nErr is then its own, or KVP_E_CALL). nErr is KVP_E_REPLY when
+ * the server replied with an error, whose text is then in oCli:cError, and
+ * KVP_E_MISSING when the reply misses a required field.
+ */
+
 #include "hbclass.ch"
 #include "common.ch"
 #include "kvpack.ch"
@@ -176,22 +213,22 @@ METHOD Unpack( hMsg, nErr ) CLASS ApiLoginReply
 
    RETURN .T.
 
-/* ApiPing: the request of command ping (2). */
-CREATE CLASS ApiPing INHERIT KvpStruct
+/* ApiHeartbeat: the request of command ping (2). */
+CREATE CLASS ApiHeartbeat INHERIT KvpStruct
 
    METHOD Pack()
    METHOD Unpack( hMsg, nErr )
 
 ENDCLASS
 
-METHOD Pack() CLASS ApiPing
+METHOD Pack() CLASS ApiHeartbeat
 
    LOCAL hMsg := KvpNew( API_CMD_PING )
 
 
    RETURN hMsg
 
-METHOD Unpack( hMsg, nErr ) CLASS ApiPing
+METHOD Unpack( hMsg, nErr ) CLASS ApiHeartbeat
 
    nErr := KVP_OK
    HB_SYMBOL_UNUSED( hMsg )
@@ -1074,5 +1111,255 @@ METHOD Unpack( hMsg, nErr ) CLASS ApiEvery
    oSet := KvpTupleSet():New()
    oSet:Read( hMsg, API_EVERY_O_SET )
    ::o_set := oSet
+
+   RETURN .T.
+
+/* ApiLoginMsg: the message of a call to command login (1). */
+CREATE CLASS ApiLoginMsg INHERIT KvpMsg
+
+   METHOD New( hMsg, nErr )
+
+ENDCLASS
+
+METHOD New( hMsg, nErr ) CLASS ApiLoginMsg
+
+   ::nCommand := API_CMD_LOGIN
+   ::request := ApiLogin():New()
+   ::reply := ApiLoginReply():New()
+   ::request:Unpack( hMsg, @nErr )
+
+   RETURN Self
+
+/* ApiPingMsg: the message of a call to command ping (2). */
+CREATE CLASS ApiPingMsg INHERIT KvpMsg
+
+   METHOD New( hMsg, nErr )
+
+ENDCLASS
+
+METHOD New( hMsg, nErr ) CLASS ApiPingMsg
+
+   ::nCommand := API_CMD_PING
+   ::request := ApiHeartbeat():New()
+   ::request:Unpack( hMsg, @nErr )
+
+   RETURN Self
+
+/* ApiQueryMsg: the message of a call to command query (3). */
+CREATE CLASS ApiQueryMsg INHERIT KvpMsg
+
+   METHOD New( hMsg, nErr )
+
+ENDCLASS
+
+METHOD New( hMsg, nErr ) CLASS ApiQueryMsg
+
+   ::nCommand := API_CMD_QUERY
+   ::request := ApiQuery():New()
+   ::reply := ApiQueryReply():New()
+   ::request:Unpack( hMsg, @nErr )
+
+   RETURN Self
+
+/* ApiEveryMsg: the message of a call to command every (4). */
+CREATE CLASS ApiEveryMsg INHERIT KvpMsg
+
+   METHOD New( hMsg, nErr )
+
+ENDCLASS
+
+METHOD New( hMsg, nErr ) CLASS ApiEveryMsg
+
+   ::nCommand := API_CMD_EVERY
+   ::request := ApiEvery():New()
+   ::request:Unpack( hMsg, @nErr )
+
+   RETURN Self
+
+/* ApiServer: the multiplexer of service api. */
+CREATE CLASS ApiServer
+
+   VAR handler   // the application's object: a method On<Command>( oMsg, oCtx ) per command
+   VAR login     // the class function of the message of command login
+   VAR ping      // the class function of the message of command ping
+   VAR query     // the class function of the message of command query
+   VAR every     // the class function of the message of command every
+
+   METHOD Init( oHandler )
+   METHOD Dispatch( hMsg, oCtx, nErr )
+
+ENDCLASS
+
+METHOD Init( oHandler ) CLASS ApiServer
+
+   ::handler := oHandler
+   ::login := @ApiLoginMsg()
+   ::ping := @ApiPingMsg()
+   ::query := @ApiQueryMsg()
+   ::every := @ApiEveryMsg()
+
+   RETURN Self
+
+METHOD Dispatch( hMsg, oCtx, nErr ) CLASS ApiServer
+
+   LOCAL oMsg
+
+   nErr := KVP_OK
+   SWITCH KvpCommand( hMsg )
+   CASE API_CMD_LOGIN
+      oMsg := ::login:exec():New( hMsg, @nErr )
+      IF nErr == KVP_OK
+         ::handler:OnLogin( oMsg, oCtx )
+      ENDIF
+      EXIT
+   CASE API_CMD_PING
+      oMsg := ::ping:exec():New( hMsg, @nErr )
+      IF nErr == KVP_OK
+         ::handler:OnPing( oMsg, oCtx )
+      ENDIF
+      EXIT
+   CASE API_CMD_QUERY
+      oMsg := ::query:exec():New( hMsg, @nErr )
+      IF nErr == KVP_OK
+         ::handler:OnQuery( oMsg, oCtx )
+      ENDIF
+      EXIT
+   CASE API_CMD_EVERY
+      oMsg := ::every:exec():New( hMsg, @nErr )
+      IF nErr == KVP_OK
+         ::handler:OnEvery( oMsg, oCtx )
+      ENDIF
+      EXIT
+   OTHERWISE
+      nErr := KVP_E_NOT_FOUND
+   ENDSWITCH
+
+   RETURN nErr == KVP_OK
+
+/* ApiClient: the calls to service api, over a transport. */
+CREATE CLASS ApiClient
+
+   VAR transport       // an object with Call( cRequest, @nErr ) --> cReply | NIL
+   VAR cError INIT ""  // the text of the last error reply
+
+   METHOD Init( oTransport )
+   METHOD Login( oReq, nErr )
+   METHOD Ping( oReq, nErr )
+   METHOD Query( oReq, nErr )
+   METHOD Every( oReq, nErr )
+
+ENDCLASS
+
+METHOD Init( oTransport ) CLASS ApiClient
+
+   ::transport := oTransport
+
+   RETURN Self
+
+METHOD Login( oReq, nErr ) CLASS ApiClient
+
+   LOCAL cReply, oReply, hMsg
+
+   ::cError := ""
+   nErr := KVP_OK
+   cReply := ::transport:Call( oReq:Encode(), @nErr )
+   IF cReply == NIL
+      IF nErr == KVP_OK
+         nErr := KVP_E_CALL
+      ENDIF
+      RETURN NIL
+   ENDIF
+   hMsg := KvpParse( cReply, @nErr )
+   IF hMsg == NIL
+      RETURN NIL
+   ENDIF
+   IF KvpErrorText( hMsg ) != NIL
+      ::cError := KvpErrorText( hMsg )
+      nErr := KVP_E_REPLY
+      RETURN NIL
+   ENDIF
+   oReply := ApiLoginReply():New()
+   IF ! oReply:Unpack( hMsg, @nErr )
+      RETURN NIL
+   ENDIF
+
+   RETURN oReply
+
+METHOD Ping( oReq, nErr ) CLASS ApiClient
+
+   LOCAL cReply, hMsg
+
+   ::cError := ""
+   nErr := KVP_OK
+   cReply := ::transport:Call( oReq:Encode(), @nErr )
+   IF cReply == NIL
+      IF nErr == KVP_OK
+         nErr := KVP_E_CALL
+      ENDIF
+      RETURN .F.
+   ENDIF
+   hMsg := KvpParse( cReply, @nErr )
+   IF hMsg == NIL
+      RETURN .F.
+   ENDIF
+   IF KvpErrorText( hMsg ) != NIL
+      ::cError := KvpErrorText( hMsg )
+      nErr := KVP_E_REPLY
+      RETURN .F.
+   ENDIF
+
+   RETURN .T.
+
+METHOD Query( oReq, nErr ) CLASS ApiClient
+
+   LOCAL cReply, oReply, hMsg
+
+   ::cError := ""
+   nErr := KVP_OK
+   cReply := ::transport:Call( oReq:Encode(), @nErr )
+   IF cReply == NIL
+      IF nErr == KVP_OK
+         nErr := KVP_E_CALL
+      ENDIF
+      RETURN NIL
+   ENDIF
+   hMsg := KvpParse( cReply, @nErr )
+   IF hMsg == NIL
+      RETURN NIL
+   ENDIF
+   IF KvpErrorText( hMsg ) != NIL
+      ::cError := KvpErrorText( hMsg )
+      nErr := KVP_E_REPLY
+      RETURN NIL
+   ENDIF
+   oReply := ApiQueryReply():New()
+   IF ! oReply:Unpack( hMsg, @nErr )
+      RETURN NIL
+   ENDIF
+
+   RETURN oReply
+
+METHOD Every( oReq, nErr ) CLASS ApiClient
+
+   LOCAL cReply, hMsg
+
+   ::cError := ""
+   nErr := KVP_OK
+   cReply := ::transport:Call( oReq:Encode(), @nErr )
+   IF cReply == NIL
+      IF nErr == KVP_OK
+         nErr := KVP_E_CALL
+      ENDIF
+      RETURN .F.
+   ENDIF
+   hMsg := KvpParse( cReply, @nErr )
+   IF hMsg == NIL
+      RETURN .F.
+   ENDIF
+   IF KvpErrorText( hMsg ) != NIL
+      ::cError := KvpErrorText( hMsg )
+      nErr := KVP_E_REPLY
+      RETURN .F.
+   ENDIF
 
    RETURN .T.

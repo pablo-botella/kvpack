@@ -85,11 +85,56 @@ func TestGen(t *testing.T) {
 			t.Errorf("%s: %v", f, err)
 		}
 	}
+	// the skeletons of the handler, named after the package and the prefix
+	for f, want := range map[string]string{
+		"api_handler-prg.txt": "METHOD OnLogin( oMsg, oCtx ) CLASS MyHandler",
+		"api_handler-go.txt":  "func (h *MyHandler) OnLogin(ctx context.Context, msg *LoginMsg) {",
+		"api_handler-c.txt":   "static void on_login(void *app, api_login_msg *msg, void *ctx)",
+	} {
+		if b, err := os.ReadFile(filepath.Join(dir, f)); err != nil || !bytes.Contains(b, []byte(want)) {
+			t.Errorf("%s: %v", f, err)
+		}
+	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "a.go")); !bytes.Contains(b, []byte("package api")) {
 		t.Error("default package is not the .kvp name")
 	}
 	if err := run([]string{"gen", apiKvp}); err == nil {
 		t.Error("gen with nothing to write accepted")
+	}
+}
+
+// A declaration that names its service gives the generated names from it,
+// not from its file name, and may be spread over files it includes.
+func TestGenService(t *testing.T) {
+	dir := t.TempDir()
+	for name, text := range map[string]string{
+		"main.kvp":  "service sqlbk\ninclude \"types.kvp\"\ncommand query = 1\n sql text = 1\nreply query\n results result = 1 list\n",
+		"types.kvp": "record result = 100\n rows tupleset = 1\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := run([]string{"gen", "-go", filepath.Join(dir, "a.go"), "-c", filepath.Join(dir, "a.h"), "-hb", filepath.Join(dir, "a.prg"), filepath.Join(dir, "main.kvp")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, want := range map[string]string{
+		"a.go":  "package sqlbk",
+		"a.h":   "} sqlbk_result;",
+		"a.prg": "CREATE CLASS SqlbkResult ",
+	} {
+		if b, _ := os.ReadFile(filepath.Join(dir, file)); !bytes.Contains(b, []byte(want)) {
+			t.Errorf("%s: no %q: the names do not start from the service", file, want)
+		}
+	}
+	// -pkg and -prefix still have the last word
+	err = run([]string{"gen", "-go", filepath.Join(dir, "b.go"), "-pkg", "other", filepath.Join(dir, "main.kvp")})
+	if b, _ := os.ReadFile(filepath.Join(dir, "b.go")); err != nil || !bytes.Contains(b, []byte("package other")) {
+		t.Errorf("-pkg ignored: %v", err)
+	}
+	if err := run([]string{"check", filepath.Join(dir, "main.kvp")}); err != nil {
+		t.Error(err)
 	}
 }
 

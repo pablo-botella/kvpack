@@ -11,4 +11,6 @@ Command-line companion of [kvpack](https://pkg.go.dev/github.com/pablo-botella/k
 it reads a `.kvp` declaration — the commands, replies and records of an
 application, with named, typed, numbered fields — checks it, generates the
 code that packs and unpacks those messages in **Go**, **C** and **Harbour**,
-and validates message files against it.
+together with a multiplexer for the side that serves the commands and a
+call per command for the side that asks, and validates message files
+against it.

@@ -1,0 +1,92 @@
+Generating the code of a service with the kvpack command
+=========================================================
+
+gen.bat (Windows) and gen.sh (Linux, macOS) in this folder generate the code
+of the test service. They run the command from the sources of this
+repository, with "go run". In a project of your own you install it once and
+call it by its name.
+
+
+1. Get the command
+
+    go install github.com/pablo-botella/kvpack/cmd/kvpack@latest
+
+   It goes to the bin folder of Go ("go env GOPATH", then bin), which must be
+   in the PATH. Without Go, take the executable for your system from the
+   releases of the repository: https://github.com/pablo-botella/kvpack/releases
+
+    kvpack version
+
+   Or install nothing and let Go fetch and run it each time. It is the same
+   command, so everything below works by writing this where it says kvpack:
+
+    go run github.com/pablo-botella/kvpack/cmd/kvpack@latest version
+
+   Write a version instead of latest (@v0.0.4) to always run the same one.
+
+
+2. Get the library the generated code is built on
+
+   Go:
+
+    go get github.com/pablo-botella/kvpack
+
+   C and Harbour: the files of the capi folder of the repository.
+     C        kvpack.c, dyn_buffer.c, kvp_arena.c and their headers
+     Harbour  kvpack.c, hbkvpack.c, kvpclass.prg and kvpack.ch
+
+
+3. Write the declaration
+
+   One .kvp file declares the service and includes the others:
+
+    # api.kvp
+    service api
+    include "api_records.kvp"
+
+    command login = 1
+        user      text   = 1
+        password  text   = 2
+    reply login
+        name      text   = 1
+
+   The files of this folder are a whole example: api.kvp, api_records.kvp,
+   api_query.kvp and api_every.kvp.
+
+
+4. Check it and generate
+
+    kvpack check api.kvp
+    kvpack gen -go api/api_kvp.go -c c/api_kvp.h -hb hb/api_kvp.prg api.kvp
+
+   Give only the outputs you want: -go, -c, -hb, or several. The folders must
+   exist. With "service api" in the declaration, the Go package and the
+   prefix of the C and Harbour names are "api"; -pkg and -prefix change them.
+
+   What is written:
+
+    -go api/api_kvp.go     api/api_kvp.go               types, multiplexer and client
+                           api/api_handler-go.txt       skeleton of a handler
+    -c c/api_kvp.h         c/api_kvp.h, c/api_kvp.c
+                           c/api_handler-c.txt
+    -hb hb/api_kvp.prg     hb/api_kvp.prg, hb/api_kvp.ch
+                           hb/api_handler-prg.txt
+
+   The generated files are not to be edited: change the .kvp and generate
+   again. The skeletons are to copy under a name of your own and fill; they
+   are written again on every run.
+
+
+5. In a Go project, let "go generate" do it
+
+   A line in any .go file of the package:
+
+    //go:generate kvpack gen -go api_kvp.go api.kvp
+
+   or, with nothing installed:
+
+    //go:generate go run github.com/pablo-botella/kvpack/cmd/kvpack@latest gen -go api_kvp.go api.kvp
+
+   and then:
+
+    go generate ./...

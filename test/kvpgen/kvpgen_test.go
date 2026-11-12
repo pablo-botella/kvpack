@@ -2,9 +2,11 @@ package kvpgen_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,24 +36,53 @@ func canonicalReply() api.LoginReply {
 	}
 }
 
+// load reads the test service: api.kvp and the files it includes.
 func load(t *testing.T) *schema.File {
 	t.Helper()
-	fh, err := os.Open("api.kvp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fh.Close()
-	f, err := schema.Parse("api.kvp", fh)
+	f, err := schema.ParseFile("api.kvp")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return f
 }
 
-// TestGeneratedFresh is the golden guard of the generated files the tests
-// compile: regenerate with
+// The test service is a declaration over several files: what the three
+// languages compile and run comes from includes, a service and a type that
+// a names section renamed.
+func TestServiceOfTheTests(t *testing.T) {
+	f := load(t)
+	if f.Service != "api" || len(f.Commands()) != 4 || len(f.Replies()) != 2 || len(f.Records()) != 2 {
+		t.Fatalf("service %q: %d commands, %d replies, %d records", f.Service, len(f.Commands()), len(f.Replies()), len(f.Records()))
+	}
+	from := map[string]string{}
+	for _, b := range f.Blocks {
+		if b.Kind != schema.Reply {
+			from[b.Name] = b.File
+		}
+	}
+	for name, file := range map[string]string{
+		"login": "api.kvp", "ping": "api.kvp", "event": "api_records.kvp", "person": "api_records.kvp",
+		"query": "api_query.kvp", "every": "api_every.kvp",
+	} {
+		if from[name] != file {
+			t.Errorf("%s: read from %q, want %q", name, from[name], file)
+		}
+	}
+	for _, b := range f.Commands() {
+		if b.Name != "ping" {
+			continue
+		}
+		if g, c, h := f.TypeName(schema.Go, b), f.TypeName(schema.C, b), f.TypeName(schema.Harbour, b); g != "heartbeat" || c != "api_heartbeat" || h != "api_heartbeat" {
+			t.Errorf("the request of ping is named %q, %q, %q", g, c, h)
+		}
+	}
+}
+
+// TestGeneratedFresh guards the generated files the tests compile: it
+// generates them again in memory and compares. Regenerate them with gen.bat,
+// or gen.sh, in this folder, which run
 //
-//	go run ./cmd/kvpack gen -go test/kvpgen/api/api_kvp.go -pkg api -c test/kvpgen/c/api_kvp.h -hb test/kvpgen/hb/api_kvp.prg test/kvpgen/api.kvp
+//	kvpack gen -go api/api_kvp.go -c c/api_kvp.h -hb hb/api_kvp.prg api.kvp
 func TestGeneratedFresh(t *testing.T) {
 	f := load(t)
 	goSrc, err := gen.Go(f, "api")
@@ -66,8 +97,21 @@ func TestGeneratedFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	skel, err := gen.HarbourHandler(f, "api", "hb/api_kvp.ch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goSkel, err := gen.GoHandler(f, "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cSkel, err := gen.CHandler(f, "api", "c/api_kvp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for path, want := range map[string][]byte{
 		"api/api_kvp.go": goSrc, "c/api_kvp.h": h, "c/api_kvp.c": c, "hb/api_kvp.ch": ch, "hb/api_kvp.prg": prg,
+		"hb/api_handler-prg.txt": skel, "api/api_handler-go.txt": goSkel, "c/api_handler-c.txt": cSkel,
 	} {
 		got, err := os.ReadFile(path)
 		if err != nil {
@@ -714,5 +758,417 @@ func TestZeroTime(t *testing.T) {
 	back, ok := m.TupleSet(2)
 	if !ok || len(back.Rows) != 1 || !back.Rows[0][0].(time.Time).Equal(ts(0)) {
 		t.Errorf("tuple: %+v", back)
+	}
+}
+
+// A service is the commands of a declaration under a name.
+func TestService(t *testing.T) {
+	f, err := schema.Parse("t.kvp", strings.NewReader("service sqlbk\ncommand query = 1\n sql text = 1"))
+	if err != nil || f.Service != "sqlbk" {
+		t.Fatalf("%v %+v", err, f)
+	}
+	// a field may still be called service, or include
+	f, err = schema.Parse("t.kvp", strings.NewReader("command a = 1\n service text = 1\n include int32 = 2"))
+	if err != nil || f.Service != "" || len(f.Blocks[0].Fields) != 2 {
+		t.Fatalf("%v %+v", err, f)
+	}
+	for _, c := range []struct{ src, want string }{
+		{"service sqlbk", "a service has one or more commands"},
+		{"service sqlbk\nrecord r = 1\n x text = 1", "a service has one or more commands"},
+		{"service a\nservice b\ncommand c = 1", "already declared (a)"},
+		{"service Sql\ncommand c = 1", "lowercase"},
+		{"service a = 2\ncommand c = 1", `expected "service name"`},
+		{"include \"other.kvp\"\ncommand c = 1", "not read from a file"},
+		{"include other.kvp\ncommand c = 1", `expected "include \"file.kvp\""`},
+	} {
+		_, err := schema.Parse("t.kvp", strings.NewReader(c.src))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v, want %q", c.src, err, c.want)
+		}
+	}
+}
+
+// write puts the files of a declaration in a directory of their own.
+func write(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, text := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// include reads other files into the same declaration: one namespace, the
+// types resolved once everything is read.
+func TestInclude(t *testing.T) {
+	dir := write(t, map[string]string{
+		// the service: its command uses a record declared in a file it
+		// includes, which in turn uses one of a third, and one of this file
+		"sqlbk.kvp": "service sqlbk\n" +
+			"include \"types/result.kvp\"\n" +
+			"include \"types/column.kvp\"\n" + // again, through result.kvp: read once
+			"command query = 1\n sql text = 1\n" +
+			"reply query\n results result = 1 list\n" +
+			"record note = 102\n text text = 1\n",
+		"types/result.kvp": "include \"column.kvp\"\n" + // relative to this file
+			"record result = 100\n rows tupleset = 1\n columns column = 2 list\n notes note = 3 list\n",
+		"types/column.kvp": "record column = 101\n name text = 1\n",
+	})
+	f, err := schema.ParseFile(filepath.Join(dir, "sqlbk.kvp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Service != "sqlbk" || len(f.Commands()) != 1 || len(f.Replies()) != 1 || len(f.Records()) != 3 {
+		t.Fatalf("%+v", f)
+	}
+	var result *schema.Block
+	for _, b := range f.Records() {
+		if b.Name == "result" {
+			result = b
+		}
+	}
+	if result == nil || !strings.HasSuffix(filepath.ToSlash(result.File), "types/result.kvp") ||
+		result.Fields[1].Record.Name != "column" || result.Fields[2].Record.Name != "note" {
+		t.Fatalf("%+v", result)
+	}
+	// and it generates as one declaration
+	if _, err := gen.Go(f, "sqlbk"); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, c := range map[string]struct {
+		files map[string]string
+		want  string
+	}{
+		"a name twice in the namespace": {map[string]string{
+			"main.kvp":  "include \"other.kvp\"\nrecord result = 1\n x text = 1\n",
+			"other.kvp": "record result = 2\n y text = 1\n",
+		}, "record result: name already used at"},
+		"a number twice": {map[string]string{
+			"main.kvp":  "include \"other.kvp\"\nrecord a = 1\n x text = 1\n",
+			"other.kvp": "record b = 1\n y text = 1\n",
+		}, "number 1 already used by record b"},
+		"a service included": {map[string]string{
+			"main.kvp":  "service one\ninclude \"other.kvp\"\ncommand a = 1\n",
+			"other.kvp": "service two\ncommand b = 2\n",
+		}, "a file that declares a service cannot be included"},
+		"a file that includes itself": {map[string]string{
+			"main.kvp":  "include \"other.kvp\"\ncommand a = 1\n",
+			"other.kvp": "include \"main.kvp\"\nrecord b = 2\n x text = 1\n",
+		}, "includes itself"},
+		"a file that is not there": {map[string]string{
+			"main.kvp": "include \"nowhere.kvp\"\ncommand a = 1\n",
+		}, "main.kvp:1: include:"},
+		"an error in the included file names it": {map[string]string{
+			"main.kvp":  "include \"other.kvp\"\ncommand a = 1\n",
+			"other.kvp": "record b = 2\n x thing = 1\n",
+		}, "other.kvp:2: field x: unknown type"},
+	} {
+		_, err := schema.ParseFile(filepath.Join(write(t, c.files), "main.kvp"))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want %q", name, err, c.want)
+		}
+	}
+}
+
+// A names section gives the generated types the names the declaration
+// wants, per language.
+func TestNames(t *testing.T) {
+	const src = "service sqlbk\n" +
+		"names\n record result = sqlbk_record\n" +
+		"names go\n package = sqldb\n command query = sqlbk_query\n reply query = sqlbk_q_response\n" +
+		"names c\n prefix = sq\n command * = call_sqlbk_*\n reply * = res_sqlbk_*\n" +
+		"names harbour\n command * = call_*\n command ping = just_ping\n" +
+		"names go server\n service = sqlbk_service\n" +
+		"names * client\n service = sqlbk_client\n" +
+		"command query = 1\n sql text = 1\n one result = 2\n" +
+		"reply query\n results result = 1 list\n" +
+		"command ping = 2\n" +
+		"record result = 100\n rows tupleset = 1\n"
+	f, err := schema.Parse("t.kvp", strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := func(kind schema.Kind, name string) *schema.Block {
+		for _, b := range f.Blocks {
+			if b.Kind == kind && b.Name == name {
+				return b
+			}
+		}
+		t.Fatalf("no %s %s", kind, name)
+		return nil
+	}
+	for _, c := range []struct {
+		lang string
+		kind schema.Kind
+		name string
+		want string
+	}{
+		{schema.Go, schema.Command, "query", "sqlbk_query"},
+		{schema.Go, schema.Reply, "query", "sqlbk_q_response"},
+		{schema.Go, schema.Record, "result", "sqlbk_record"}, // from the section for all
+		{schema.Go, schema.Command, "ping", ""},              // not named: the default
+		{schema.C, schema.Command, "query", "call_sqlbk_query"},
+		{schema.C, schema.Reply, "query", "res_sqlbk_query"}, // * is the command of the reply
+		{schema.C, schema.Command, "ping", "call_sqlbk_ping"},
+		{schema.C, schema.Record, "result", "sqlbk_record"},
+		{schema.Harbour, schema.Command, "query", "call_query"},
+		{schema.Harbour, schema.Command, "ping", "just_ping"}, // its own line wins over the pattern
+		{schema.Harbour, schema.Reply, "query", ""},
+	} {
+		if got := f.TypeName(c.lang, block(c.kind, c.name)); got != c.want {
+			t.Errorf("%s, %s %s: %q, want %q", c.lang, c.kind, c.name, got, c.want)
+		}
+	}
+	if f.Package() != "sqldb" || f.Prefix(schema.C) != "sq" || f.Prefix(schema.Harbour) != "" {
+		t.Errorf("package %q, prefixes %q %q", f.Package(), f.Prefix(schema.C), f.Prefix(schema.Harbour))
+	}
+	if f.ServiceName(schema.Go, "server") != "sqlbk_service" || f.ServiceName(schema.Go, "client") != "sqlbk_client" ||
+		f.ServiceName(schema.C, "client") != "sqlbk_client" || f.ServiceName(schema.C, "server") != "" {
+		t.Error("service names")
+	}
+
+	// the generated code carries them, each language in its own convention
+	goSrc, err := gen.Go(f, "sqldb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, c, err := gen.C(f, "sq", "t.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, prg, err := gen.Harbour(f, "sqlbk", "t.ch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for what, c := range map[string]struct {
+		src  []byte
+		want []string
+	}{
+		"Go": {goSrc, []string{"type SqlbkQuery struct", "type SqlbkQResponse struct", "type SqlbkRecord struct", "type Ping struct",
+			"Results []SqlbkRecord", "One *SqlbkRecord", "func (s *SqlbkQuery) Pack()", "CmdQuery ",
+			// the service is named in "names go server"
+			"type SqlbkService struct", "type SqlbkServiceHandler interface", "func NewSqlbkService(h SqlbkServiceHandler) *SqlbkService",
+			"OnQuery(ctx context.Context, msg *QueryMsg)", "Request SqlbkQuery", "Reply   SqlbkQResponse"}},
+		"C header": {h, []string{"} call_sqlbk_query;", "} res_sqlbk_query;", "} sqlbk_record;", "} sqlbk_record_st;",
+			"sqlbk_record_st one;", "int call_sqlbk_query_encode(", "int res_sqlbk_query_add_results(kvp_buffer *a, res_sqlbk_query *s, const sqlbk_record *v);",
+			"#define SQ_CMD_QUERY", "#define SQ_QUERY_SQL",
+			// no name for the service in C: the prefix
+			"} sq_query_msg;", "call_sqlbk_query request;", "res_sqlbk_query reply;", "} sq_handler;",
+			"int sq_dispatch(const sq_handler *h, void *app, const kvp_buffer *b, void *ctx);"}},
+		"C source": {c, []string{"sqlbk_record_put(&sub, a, &s->one.value);", "rc = sqlbk_record_read(b, &sub, &s->one.value);"}},
+		"Harbour": {prg, []string{"CREATE CLASS CallQuery ", "CREATE CLASS JustPing ", "CREATE CLASS SqlbkQueryReply ", "CREATE CLASS SqlbkRecord ",
+			"::one := SqlbkRecord():New()", "oSub := SqlbkRecord():New()",
+			"CREATE CLASS SqlbkServer\n", "CREATE CLASS SqlbkQueryMsg INHERIT KvpMsg", "::request := CallQuery():New()", "::handler:OnQuery( oMsg, oCtx )"}},
+	} {
+		for _, want := range c.want {
+			if !bytes.Contains(c.src, []byte(want)) {
+				t.Errorf("%s: no %q", what, want)
+			}
+		}
+	}
+
+	for _, c := range []struct{ src, want string }{
+		{"names python\ncommand a = 1", "unknown language"},
+		{"names go both\ncommand a = 1", "unknown side"},
+		{"names go client extra\ncommand a = 1", "expected"},
+		{"names\n package = x\ncommand a = 1", "package is of a go section"},
+		{"names go\n prefix = x\ncommand a = 1", "prefix is of a c or harbour section"},
+		{"names\n command b = x\ncommand a = 1", "names: no command b"},
+		{"names\n reply a = x\ncommand a = 1", "names: no reply a"},
+		{"names\n record a = x\ncommand a = 1", "names: no record a"},
+		{"names\n command a = Upper\ncommand a = 1", "lowercase"},
+		{"names\n command * = fixed\ncommand a = 1", "needs one *"},
+		{"names\n command a = x\n command a = y\ncommand a = 1", "already named (x)"},
+		{"names go\n package = x\n package = y\ncommand a = 1", "already named (x)"},
+		{"names c client\n command a = x\ncommand a = 1", "a type is named per language"},
+		{"names\n colour = x\ncommand a = 1", "unknown entry"},
+		{"names\n service x y\ncommand a = 1", `expected "service = name"`},
+	} {
+		_, err := schema.Parse("t.kvp", strings.NewReader(c.src))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v, want %q", c.src, err, c.want)
+		}
+	}
+	// two types that end up with one name are refused when generating
+	f, err = schema.Parse("t.kvp", strings.NewReader("names\n command a = same\n record b = same\ncommand a = 1\nrecord b = 2\n x text = 1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gen.Go(f, "t"); err == nil || !strings.Contains(err.Error(), "are both named same in go") {
+		t.Errorf("one name twice: %v", err)
+	}
+	// a field may still be called names
+	if _, err := schema.Parse("t.kvp", strings.NewReader("command a = 1\n names text = 1")); err != nil {
+		t.Error(err)
+	}
+}
+
+// The server side generated from api.kvp, with no transport: a handler of
+// the application, the message it gets for each call, and a context the
+// multiplexer only passes on. Here the context carries where the handler
+// leaves the bytes of what it replies.
+type testHandler struct{ calls int }
+
+type replyKey struct{}
+
+func leave(ctx context.Context, b []byte) { *ctx.Value(replyKey{}).(*[]byte) = b }
+
+func (h *testHandler) OnLogin(ctx context.Context, msg *api.LoginMsg) {
+	h.calls++
+	if msg.Request.Password != "secret" {
+		leave(ctx, msg.PackError("wrong password").Encode())
+		return
+	}
+	msg.Reply.Name = strings.ToUpper(msg.Request.User) // the reply is there, empty: just fill it
+	msg.Reply.Expires = ts(1700000000)
+	leave(ctx, msg.Pack().Encode())
+}
+
+func (h *testHandler) OnPing(ctx context.Context, msg *api.PingMsg) {
+	h.calls++
+	leave(ctx, msg.Pack().Encode())
+}
+
+func (h *testHandler) OnQuery(ctx context.Context, msg *api.QueryMsg) {
+	h.calls++
+	msg.Reply.Code = int32(len(msg.Request.Sql))
+	msg.Reply.Rows = kvpack.NewTupleSet(kvpack.NewTupleDef().Field("n", kvpack.Int32))
+	msg.Reply.Rows.Add(int32(1))
+	leave(ctx, msg.Pack().Encode())
+}
+
+func (h *testHandler) OnEvery(ctx context.Context, msg *api.EveryMsg) {
+	h.calls++
+	leave(ctx, []byte(msg.Request.RText)) // nothing says a handler must reply a message
+}
+
+func TestServer(t *testing.T) {
+	h := &testHandler{}
+	srv := api.NewServer(h)
+	call := func(m *kvpack.Message) ([]byte, error) {
+		t.Helper()
+		in, err := kvpack.Decode(m.Encode()) // as it would arrive
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []byte
+		err = srv.Dispatch(context.WithValue(context.Background(), replyKey{}, &out), in)
+		return out, err
+	}
+	decode := func(b []byte) *kvpack.Message {
+		t.Helper()
+		m, err := kvpack.Decode(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	// a call: the request is unpacked into the message, the handler fills the reply
+	out, err := call((&api.Login{User: "bob", Password: "secret"}).Pack())
+	if err != nil || h.calls != 1 {
+		t.Fatalf("%v, %d calls", err, h.calls)
+	}
+	var login api.LoginReply
+	if err := login.Unpack(decode(out)); err != nil || login.Name != "BOB" || !login.Expires.Equal(ts(1700000000)) ||
+		login.Events != nil || login.Owner != nil { // what the handler did not touch is empty
+		t.Errorf("%v %+v", err, login)
+	}
+	// an error reply is the handler's to send
+	out, err = call((&api.Login{User: "bob", Password: "no"}).Pack())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := login.Unpack(decode(out)); err == nil || err.Error() != "wrong password" {
+		t.Errorf("error reply: %v", err)
+	}
+	// a command with no reply: an empty message of its number
+	out, err = call((&api.Heartbeat{}).Pack())
+	if m := decode(out); err != nil || m.Command != api.CmdPing || len(m.Items) != 0 {
+		t.Errorf("ping: %v %+v", err, m)
+	}
+	// a reply with a tupleset
+	out, err = call((&api.Query{Sql: "select"}).Pack())
+	var query api.QueryReply
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := query.Unpack(decode(out)); err != nil || query.Code != 6 || len(query.Rows.Rows) != 1 || query.Rows.Rows[0][0] != int32(1) {
+		t.Errorf("query: %v %+v", err, query)
+	}
+	// the context is the caller's: the handler may leave anything in it
+	every := everyFull()
+	every.RText = "as it came"
+	if out, err = call(every.Pack()); err != nil || string(out) != "as it came" || h.calls != 5 {
+		t.Errorf("every: %v %q, %d calls", err, out, h.calls)
+	}
+
+	// a command that is none of these, and a request with a required field
+	// missing: nobody is called
+	if _, err := call(kvpack.New(99)); err == nil || err.Error() != "unknown command 99" {
+		t.Errorf("unknown command: %v", err)
+	}
+	if _, err := call(kvpack.New(api.CmdLogin).AddText(1, "bob")); err == nil || err.Error() != "login: missing password" {
+		t.Errorf("missing field: %v", err)
+	}
+	if h.calls != 5 {
+		t.Errorf("%d calls", h.calls)
+	}
+}
+
+// loop carries the calls of a client straight to a multiplexer, in memory:
+// the two generated sides against each other, with no transport.
+type loop struct{ srv *api.Server }
+
+func (l loop) Call(ctx context.Context, req *kvpack.Message) (*kvpack.Message, error) {
+	in, err := kvpack.Decode(req.Encode()) // as it would arrive
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	if err := l.srv.Dispatch(context.WithValue(ctx, replyKey{}, &out), in); err != nil {
+		return nil, err
+	}
+	return kvpack.Decode(out)
+}
+
+func TestClient(t *testing.T) {
+	h := &testHandler{}
+	c := api.NewClient(loop{api.NewServer(h)})
+	ctx := context.Background()
+
+	// a call: the request out, the reply back, both typed
+	reply, err := c.Login(ctx, &api.Login{User: "bob", Password: "secret"})
+	if err != nil || reply.Name != "BOB" || !reply.Expires.Equal(ts(1700000000)) {
+		t.Fatalf("%v %+v", err, reply)
+	}
+	// an error reply is the error of the call, with the server's text
+	if reply, err := c.Login(ctx, &api.Login{User: "bob", Password: "no"}); err == nil || err.Error() != "wrong password" || reply != nil {
+		t.Errorf("error reply: %v %+v", err, reply)
+	}
+	// a command with no reply gives only an error
+	if err := c.Ping(ctx, &api.Heartbeat{}); err != nil { // the request of ping, under the name the declaration gives it
+		t.Errorf("ping: %v", err)
+	}
+	// a reply with a tupleset
+	q, err := c.Query(ctx, &api.Query{Sql: "select"})
+	if err != nil || q.Code != 6 || len(q.Rows.Rows) != 1 {
+		t.Errorf("query: %v %+v", err, q)
+	}
+	// what the caller could not do is the error of the call: here the
+	// handler of every replies bytes that are no message
+	every := everyFull()
+	if err := c.Every(ctx, &every); err == nil {
+		t.Error("every: a reply that is no message was taken")
+	}
+	if h.calls != 5 {
+		t.Errorf("%d calls", h.calls)
 	}
 }

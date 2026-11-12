@@ -14,6 +14,10 @@ mkskill:
 | **Type** | `int32` (4 bytes), `int64` (8), `ts` (8: Unix seconds, UTC), `text` (UTF-8, no terminator), `bin` (raw), `msg` (a whole message nested as the value), `bool` (1), `float64` (8, IEEE 754), `ds` (8: a day as `yyyymmdd`, Harbour's `DToS`) `null` (0: the key is present and has no value), or the pair `tupledef` / `tuple`. |
 | **Tuples** | A structure declared on the fly and then repeated: under one key a `tupledef` (per field its type, its name and a meta that is the application's) and right after it zero or more `tuple` items, each with one value per field, or null. |
 | **Error reply** | A reply whose key 0 holds a text. `NewError` builds one, `ErrorText` reads it; a transport status (HTTP, say) stays at success because the message is the protocol. |
+| **Service** | The commands of one `.kvp` declaration, grouped under a name. The name is not on the wire and routes nothing: it groups, and it is what the generated names start from. |
+| **Multiplexer** | Generated from a `.kvp` for the side that serves: given a message, it finds its command, unpacks the request and calls the handler. It has no transport in it. |
+| **Handler** | The application's part of the server side: a function per command, `On` and its name, that gets the message of the call and its context. |
+| **Context** | Whatever the caller of the multiplexer gives for one call (who asks, how to reply). The generated code passes it on and never looks at it. |
 | **Canonical message** | A fixed message whose bytes are pinned in the Go, C and Harbour tests, so the three implementations are proven to agree byte for byte. |
 
 The package **encodes and decodes** — it does not own a server, a socket or

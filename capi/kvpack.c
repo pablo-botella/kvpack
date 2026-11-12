@@ -1167,6 +1167,7 @@ const char *kvp_error_str(int error)
     case KVP_E_TYPE:      return "wrong type";
     case KVP_E_MISSING:   return "required field missing";
     case KVP_E_REPLY:     return "error reply";
+    case KVP_E_CALL:      return "call failed";
     }
     return "unknown error";
 }

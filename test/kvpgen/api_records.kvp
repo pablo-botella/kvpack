@@ -1,0 +1,16 @@
+# The records of the test service, shared by its calls. A file that declares
+# no service: it is included by api.kvp.
+record event = 100
+    id        int32  = 1
+    title     text   = 2
+    big       int64  = 3   optional
+    blob      bin    = 4   optional
+    raw       msg    = 5   optional
+    codes     int32  = 6   list
+    who       person = 7
+    active    bool   = 8   optional
+    score     float64 = 9  optional
+    day       ds     = 10  optional
+
+record person = 101
+    name      text   = 1

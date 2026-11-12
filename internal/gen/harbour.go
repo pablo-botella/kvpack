@@ -42,7 +42,11 @@ func Harbour(f *schema.File, prefix, chname string) (ch, prg []byte, err error) 
 	if !prefixRe.MatchString(prefix) {
 		return nil, nil, fmt.Errorf("Harbour prefix %q: use lowercase letters, digits and _", prefix)
 	}
-	if err := cCheck(f, prefix); err != nil { // same names, same collisions
+	tn, err := typeNames(f, schema.Harbour, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cCheck(f, prefix, tn); err != nil { // same names, same collisions
 		return nil, nil, err
 	}
 	if err := holdsItself(f); err != nil {
@@ -78,12 +82,217 @@ func Harbour(f *schema.File, prefix, chname string) (ch, prg []byte, err error) 
 	}
 	cw("\n#endif\n")
 
+	sv, err := hbService(f, prefix, tn)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	pw("/* %s */\n%s", header(f), hbUsage)
+	if sv != nil {
+		pw("%s", hbServerUsage)
+	}
 	pw("#include \"hbclass.ch\"\n#include \"common.ch\"\n#include \"kvpack.ch\"\n#include \"%s\"\n", baseName(chname))
 	for _, bl := range f.Blocks {
-		hbBlock(pw, prefix, P, bl)
+		hbBlock(pw, tn, P, bl)
+	}
+	if sv != nil {
+		hbServer(pw, sv, tn, P)
+		hbClient(pw, sv, tn)
 	}
 	return []byte(cb.String()), []byte(pb.String()), nil
+}
+
+// hbServerReserved are the command names the multiplexer class cannot take
+// as a variable, beyond those no class can.
+var hbServerReserved = map[string]bool{"handler": true, "dispatch": true}
+
+// hbSvc is what the server side of a declaration is called in Harbour.
+type hbSvc struct {
+	f      *schema.File
+	client string            // the client class
+	class  string            // the multiplexer
+	msg    map[string]string // per command, the class of its message
+	reply  map[string]*schema.Block
+	prefix string
+}
+
+// hbService names the server side: the multiplexer and, per command, the
+// class of the message of a call. nil when the declaration has no command.
+func hbService(f *schema.File, prefix string, tn names) (*hbSvc, error) {
+	if len(f.Commands()) == 0 {
+		return nil, nil
+	}
+	name := f.ServiceName(schema.Harbour, "server")
+	if name == "" {
+		name = prefix + "_server"
+	}
+	sv := &hbSvc{f: f, class: camel(name), msg: map[string]string{}, reply: map[string]*schema.Block{}, prefix: prefix}
+	cname := f.ServiceName(schema.Harbour, "client")
+	if cname == "" {
+		cname = prefix + "_client"
+	}
+	sv.client = camel(cname)
+	if strings.EqualFold(sv.client, sv.class) {
+		return nil, fmt.Errorf("%s: the client and the multiplexer are both called %s in Harbour", f.Name, sv.client)
+	}
+	taken := map[string]string{strings.ToUpper(sv.class): "the multiplexer", strings.ToUpper(sv.client): "the client"}
+	for b, n := range tn {
+		taken[strings.ToUpper(camel(n))] = b.Kind.String() + " " + b.Name
+	}
+	for _, b := range f.Replies() {
+		sv.reply[b.Name] = b
+	}
+	for _, b := range f.Commands() {
+		if hbReserved[b.Name] || hbServerReserved[b.Name] {
+			return nil, fmt.Errorf("%s:%d: command name %q is taken in the Harbour multiplexer class", b.File, b.Line, b.Name)
+		}
+		if hbClientReserved[b.Name] {
+			return nil, fmt.Errorf("%s:%d: command name %q is taken in the Harbour client class", b.File, b.Line, b.Name)
+		}
+		cls := camel(prefix+"_"+b.Name) + "Msg"
+		if o, ok := taken[strings.ToUpper(cls)]; ok { // Harbour does not tell case apart
+			return nil, fmt.Errorf("%s:%d: the message class %s of command %s has the name of %s", b.File, b.Line, cls, b.Name, o)
+		}
+		taken[strings.ToUpper(cls)] = "the message of command " + b.Name
+		sv.msg[b.Name] = cls
+	}
+	return sv, nil
+}
+
+const hbServerUsage = `/*
+ * The server side, with no transport in it. Three pieces:
+ *   the handler   an object of the application with a method On<Command> per
+ *                 command: OnLogin( oMsg, oCtx ). It is given to the
+ *                 multiplexer
+ *   the message   oMsg, created by the multiplexer for each call from the
+ *                 class of its command:
+ *                   oMsg:request   the request, unpacked
+ *                   oMsg:reply     the reply, new and empty, to fill (NIL
+ *                                  when the command declares no reply)
+ *                   oMsg:Pack()    the reply as a message; oMsg:Encode() its
+ *                                  bytes; oMsg:PackError( cText ) an error
+ *                                  reply instead
+ *   the context   oCtx, whatever the caller of Dispatch gives for the call:
+ *                 the multiplexer passes it on and never looks at it
+ *
+ *   oSrv := <Service>():New( oHandler )
+ *   lOk  := oSrv:Dispatch( hMsg, oCtx, @nErr )   hMsg a parsed message
+ *
+ * Dispatch creates the message of the command, unpacks the request into it
+ * and calls the handler; that is all it does. What is replied, and how it
+ * reaches the caller, is the handler's, with oMsg and oCtx. It says .F. and
+ * calls nobody when the command is none of the service (KVP_E_NOT_FOUND) or
+ * the request misses a required field (KVP_E_MISSING).
+ *
+ * The client side, with no transport in it either:
+ *   oCli := <Client>():New( oTransport )
+ *   oReply := oCli:Login( oReq, @nErr )   an object of the reply's class, or
+ *                                         NIL with nErr set; a command that
+ *                                         declares no reply gives .T. or .F.
+ * oTransport is any object with a method Call( cRequest, @nErr ) that sends
+ * the bytes of a request and returns those of the reply, or NIL when it
+ * could not (nErr is then its own, or KVP_E_CALL). nErr is KVP_E_REPLY when
+ * the server replied with an error, whose text is then in oCli:cError, and
+ * KVP_E_MISSING when the reply misses a required field.
+ */
+
+`
+
+// hbServer writes the message class of every command and the multiplexer.
+func hbServer(pw func(string, ...any), sv *hbSvc, tn names, P string) {
+	cmds := sv.f.Commands()
+	for _, b := range cmds {
+		cls := sv.msg[b.Name]
+		pw("\n/* %s: the message of a call to command %s (%d). */\n", cls, b.Name, b.Number)
+		pw("CREATE CLASS %s INHERIT KvpMsg\n\n   METHOD New( hMsg, nErr )\n\nENDCLASS\n", cls)
+		pw("\nMETHOD New( hMsg, nErr ) CLASS %s\n\n", cls)
+		pw("   ::nCommand := %s\n", cNum(P, b))
+		pw("   ::request := %s():New()\n", tn.camel(b))
+		if r := sv.reply[b.Name]; r != nil {
+			pw("   ::reply := %s():New()\n", tn.camel(r))
+		}
+		pw("   ::request:Unpack( hMsg, @nErr )\n\n   RETURN Self\n")
+	}
+
+	width := len("handler")
+	for _, b := range cmds {
+		width = max(width, len(b.Name))
+	}
+	what := "the commands of " + baseName(sv.f.Name)
+	if sv.f.Service != "" {
+		what = "service " + sv.f.Service
+	}
+	pw("\n/* %s: the multiplexer of %s. */\n", sv.class, what)
+	pw("CREATE CLASS %s\n\n", sv.class)
+	pw("   VAR %-*s   // the application's object: a method On<Command>( oMsg, oCtx ) per command\n", width, "handler")
+	for _, b := range cmds {
+		pw("   VAR %-*s   // the class function of the message of command %s\n", width, b.Name, b.Name)
+	}
+	pw("\n   METHOD Init( oHandler )\n   METHOD Dispatch( hMsg, oCtx, nErr )\n\nENDCLASS\n")
+	pw("\nMETHOD Init( oHandler ) CLASS %s\n\n   ::handler := oHandler\n", sv.class)
+	for _, b := range cmds {
+		pw("   ::%s := @%s()\n", b.Name, sv.msg[b.Name])
+	}
+	pw("\n   RETURN Self\n")
+	pw("\nMETHOD Dispatch( hMsg, oCtx, nErr ) CLASS %s\n\n   LOCAL oMsg\n\n   nErr := KVP_OK\n   SWITCH KvpCommand( hMsg )\n", sv.class)
+	for _, b := range cmds {
+		pw("   CASE %s\n", cNum(P, b))
+		pw("      oMsg := ::%s:exec():New( hMsg, @nErr )\n", b.Name)
+		pw("      IF nErr == KVP_OK\n         ::handler:On%s( oMsg, oCtx )\n      ENDIF\n      EXIT\n", camel(b.Name))
+	}
+	pw("   OTHERWISE\n      nErr := KVP_E_NOT_FOUND\n   ENDSWITCH\n\n   RETURN nErr == KVP_OK\n")
+}
+
+// HarbourHandler generates the skeleton of the handler an application
+// writes for the server side: a class with a method per command, to copy
+// and fill. It is no part of what is compiled. chname is the .ch file name
+// of the generated code.
+func HarbourHandler(f *schema.File, prefix, chname string) ([]byte, error) {
+	tn, err := typeNames(f, schema.Harbour, prefix)
+	if err != nil {
+		return nil, err
+	}
+	sv, err := hbService(f, prefix, tn)
+	if err != nil || sv == nil {
+		return nil, err
+	}
+	var b strings.Builder
+	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+	fields := func(bl *schema.Block) string {
+		var n []string
+		for _, fl := range bl.Fields {
+			n = append(n, fl.Name)
+		}
+		if len(n) == 0 {
+			return "no fields"
+		}
+		return strings.Join(n, ", ")
+	}
+	w("// Skeleton of the handler of %s, generated by kvpack: the object an\n", baseName(f.Name))
+	w("// application gives to the multiplexer, with a method per command.\n")
+	w("// Copy it under a name of your own and fill it; this file is written\n")
+	w("// again every time the code is generated.\n")
+	w("//\n//    oSrv := %s():New( MyHandler():New() )\n//    oSrv:Dispatch( hMsg, oCtx, @nErr )\n\n", sv.class)
+	w("#include \"hbclass.ch\"\n#include \"common.ch\"\n#include \"kvpack.ch\"\n#include \"%s\"\n\n", baseName(chname))
+	w("CREATE CLASS MyHandler\n\n")
+	for _, c := range f.Commands() {
+		w("   METHOD On%s( oMsg, oCtx )\n", camel(c.Name))
+	}
+	w("\nENDCLASS\n")
+	for _, c := range f.Commands() {
+		w("\n// Command %s (%d).\n", c.Name, c.Number)
+		w("//    oMsg:request   %s: %s\n", tn.camel(c), fields(c))
+		if r := sv.reply[c.Name]; r != nil {
+			w("//    oMsg:reply     %s, new and empty, to fill: %s\n", tn.camel(r), fields(r))
+		} else {
+			w("//    oMsg:reply     NIL: the command declares no reply\n")
+		}
+		w("//    oMsg:Pack()    the reply as a message\n")
+		w("//    oCtx           what the caller of Dispatch gave for this call\n")
+		w("METHOD On%s( oMsg, oCtx ) CLASS MyHandler\n\n", camel(c.Name))
+		w("   HB_SYMBOL_UNUSED( oMsg )\n   HB_SYMBOL_UNUSED( oCtx )\n\n   RETURN NIL\n")
+	}
+	return []byte(b.String()), nil
 }
 
 const hbUsage = `
@@ -116,8 +325,6 @@ const hbUsage = `
 
 `
 
-func hbName(prefix, block string) string { return camel(prefix) + camel(block) }
-
 // hbPresent is the test that an optional field of that type is not empty.
 func hbPresent(fl *schema.Field, v string) string {
 	switch fl.Type {
@@ -129,8 +336,8 @@ func hbPresent(fl *schema.Field, v string) string {
 	return "! Empty( " + v + " )"
 }
 
-func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
-	cls := hbName(prefix, blockName(bl))
+func hbBlock(pw func(string, ...any), tn names, P string, bl *schema.Block) {
+	cls := tn.camel(bl)
 	hasList, hasRec, hasSet := false, false, false
 	width := 0
 	for _, fl := range bl.Fields {
@@ -160,11 +367,11 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 		init, what := hbTypes[fl.Type].zero, fl.Type
 		switch {
 		case fl.List && fl.Type == schema.Rec:
-			init, what = "{}", "list of "+hbName(prefix, fl.Record.Name)
+			init, what = "{}", "list of "+tn.camel(fl.Record)
 		case fl.List:
 			init, what = "{}", "list of "+fl.Type
 		case fl.Type == schema.Rec:
-			what = hbName(prefix, fl.Record.Name)
+			what = tn.camel(fl.Record)
 		case fl.Type == schema.TupleSet:
 			what = "KvpTupleSet"
 		}
@@ -192,7 +399,7 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 			made = append(made, fmt.Sprintf("   ::%s := KvpTupleSet():New()\n", fl.Name))
 		case fl.Optional && !fl.Nullable:
 		case fl.Type == schema.Rec:
-			made = append(made, fmt.Sprintf("   ::%s := %s():New()\n", fl.Name, hbName(prefix, fl.Record.Name)))
+			made = append(made, fmt.Sprintf("   ::%s := %s():New()\n", fl.Name, tn.camel(fl.Record)))
 		case fl.Type == schema.Msg:
 			made = append(made, fmt.Sprintf("   ::%s := KvpNew( 0 )\n", fl.Name))
 		}
@@ -228,7 +435,7 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 		addAlways := add
 		switch fl.Type {
 		case schema.Rec:
-			addAlways = fmt.Sprintf("%s( hMsg, %s, iif( %s == NIL, %s():New(), %s ):Pack() )", t.add, key, v, hbName(prefix, fl.Record.Name), v)
+			addAlways = fmt.Sprintf("%s( hMsg, %s, iif( %s == NIL, %s():New(), %s ):Pack() )", t.add, key, v, tn.camel(fl.Record), v)
 		case schema.Msg:
 			addAlways = fmt.Sprintf("%s( hMsg, %s, iif( %s == NIL, KvpNew( 0 ), %s ) )", t.add, key, v, v)
 		}
@@ -294,7 +501,7 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 			pw("   FOR nI := 1 TO KvpCount( hMsg )\n      aItem := KvpItem( hMsg, nI )\n")
 			pw("      IF aItem[ KVP_ITEM_KEY ] == %s .AND. aItem[ KVP_ITEM_TYPE ] == %s\n", key, t.kvp)
 			if fl.Type == schema.Rec {
-				pw("         oSub := %s():New()\n", hbName(prefix, fl.Record.Name))
+				pw("         oSub := %s():New()\n", tn.camel(fl.Record))
 				pw("         IF ! oSub:Unpack( aItem[ KVP_ITEM_VALUE ], @nErr )\n            RETURN .F.\n         ENDIF\n")
 				pw("         AAdd( %s, oSub )\n", v)
 			} else {
@@ -309,7 +516,7 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 			}
 			pw("   %s KvpType( hMsg, %s ) == %s\n", first, key, t.kvp)
 			if fl.Type == schema.Rec {
-				pw("      oSub := %s():New()\n", hbName(prefix, fl.Record.Name))
+				pw("      oSub := %s():New()\n", tn.camel(fl.Record))
 				pw("      IF ! oSub:Unpack( KvpGet( hMsg, %s ), @nErr )\n         RETURN .F.\n      ENDIF\n", key)
 				pw("      %s := oSub\n", v)
 			} else {
@@ -319,4 +526,50 @@ func hbBlock(pw func(string, ...any), prefix, P string, bl *schema.Block) {
 		}
 	}
 	pw("\n   RETURN .T.\n")
+}
+
+// hbClientReserved are the command names the client class cannot take as a
+// method, beyond those no class can.
+var hbClientReserved = map[string]bool{"transport": true, "cerror": true}
+
+// hbClient writes the client class: a method per command over a transport.
+func hbClient(pw func(string, ...any), sv *hbSvc, tn names) {
+	cmds := sv.f.Commands()
+	what := "the commands of " + baseName(sv.f.Name)
+	if sv.f.Service != "" {
+		what = "service " + sv.f.Service
+	}
+	pw("\n/* %s: the calls to %s, over a transport. */\n", sv.client, what)
+	pw("CREATE CLASS %s\n\n", sv.client)
+	pw("   VAR transport       // an object with Call( cRequest, @nErr ) --> cReply | NIL\n")
+	pw("   VAR cError INIT \"\"  // the text of the last error reply\n\n")
+	pw("   METHOD Init( oTransport )\n")
+	for _, b := range cmds {
+		pw("   METHOD %s( oReq, nErr )\n", camel(b.Name))
+	}
+	pw("\nENDCLASS\n")
+	pw("\nMETHOD Init( oTransport ) CLASS %s\n\n   ::transport := oTransport\n\n   RETURN Self\n", sv.client)
+	for _, b := range cmds {
+		r := sv.reply[b.Name]
+		pw("\nMETHOD %s( oReq, nErr ) CLASS %s\n\n", camel(b.Name), sv.client)
+		if r != nil {
+			pw("   LOCAL cReply, oReply, hMsg\n\n")
+		} else {
+			pw("   LOCAL cReply, hMsg\n\n")
+		}
+		pw("   ::cError := \"\"\n   nErr := KVP_OK\n")
+		pw("   cReply := ::transport:Call( oReq:Encode(), @nErr )\n")
+		fail := "NIL"
+		if r == nil {
+			fail = ".F."
+		}
+		pw("   IF cReply == NIL\n      IF nErr == KVP_OK\n         nErr := KVP_E_CALL\n      ENDIF\n      RETURN %s\n   ENDIF\n", fail)
+		pw("   hMsg := KvpParse( cReply, @nErr )\n   IF hMsg == NIL\n      RETURN %s\n   ENDIF\n", fail)
+		pw("   IF KvpErrorText( hMsg ) != NIL\n      ::cError := KvpErrorText( hMsg )\n      nErr := KVP_E_REPLY\n      RETURN %s\n   ENDIF\n", fail)
+		if r != nil {
+			pw("   oReply := %s():New()\n   IF ! oReply:Unpack( hMsg, @nErr )\n      RETURN NIL\n   ENDIF\n\n   RETURN oReply\n", tn.camel(r))
+		} else {
+			pw("\n   RETURN .T.\n")
+		}
+	}
 }

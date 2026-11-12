@@ -46,6 +46,46 @@
  * from: its lists and tuplesets are written as they arrived.
  */
 
+/*
+ * The server side, with no transport in it. Three pieces:
+ *   the handler   a struct with a function per command, on_<command>(app,
+ *                 msg, ctx), and app, the application's own pointer
+ *   the message   msg, created by the multiplexer for each call:
+ *                   msg->request   the request, decoded; its texts lie in
+ *                                  msg->b, the buffer the message came in
+ *                   msg->reply     the reply, at zero, to fill (there is
+ *                                  none when the command declares no reply)
+ *                 The reply is written with its own _size and _encode, and
+ *                 an arena of the handler's for what it holds of variable
+ *                 size
+ *   the context   ctx, whatever the caller of the multiplexer gives for the
+ *                 call: it is passed on and never looked at
+ *
+ *   X_dispatch(&handler, app, &b, ctx)   b holds a message (kvp_buffer_wrap)
+ *
+ * It verifies the message, decodes the request into the message of its
+ * command and calls the handler; that is all it does. What is replied, and
+ * how it reaches the caller, is the handler's. It calls nobody and returns
+ * the error of kvp_parse when the bytes are no message, KVP_E_NOT_FOUND when
+ * the command is none of these or its function is NULL, and KVP_E_MISSING
+ * when the request misses a required field.
+ *
+ * The client side, with no transport in it either. A client is a function,
+ * call(transport, io), and transport, its own pointer: the function sends
+ * the request io holds and leaves the reply in io, returning 0, or anything
+ * else when it could not. Per command:
+ *
+ *   X_call_<command>(&client, &req, &a, &io, &reply)
+ *
+ * encodes req (its variable data in the arena a) into io, calls, and decodes
+ * the reply into reply, which refers to the bytes of io. io is a growing
+ * kvp_buffer of the caller's, other than a: what it held is gone. It returns
+ * KVP_E_CALL when the transport failed, KVP_E_REPLY when the server replied
+ * with an error (read it with kvp_error_text over io), KVP_E_MISSING when
+ * the reply misses a required field, KVP_E_FULL when there is no memory. A
+ * command that declares no reply takes no reply argument.
+ */
+
 #ifndef API_KVP_H
 #define API_KVP_H
 
@@ -213,7 +253,7 @@ typedef struct {
 /* Request of command ping (2). */
 typedef struct {
     kvp_span kvp; /* where the message a decoded struct was read from lies */
-} api_ping;
+} api_heartbeat;
 
 /* Request of command query (3). */
 typedef struct {
@@ -323,12 +363,12 @@ int api_login_reply_decode(const kvp_buffer *b, api_login_reply *s);
 int api_login_reply_add_events(kvp_buffer *a, api_login_reply *s, const api_event *v);
 int api_login_reply_events(const kvp_buffer *b, const api_login_reply *s, kvp_item *it, api_event *v);
 
-/* api_ping */
-void api_ping_put(kvp_out *o, const kvp_buffer *a, const api_ping *s);
-size_t api_ping_size(const api_ping *s, const kvp_buffer *a);
-int api_ping_encode(const api_ping *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len);
-int api_ping_read(const kvp_buffer *b, const kvp_message *m, api_ping *s);
-int api_ping_decode(const kvp_buffer *b, api_ping *s);
+/* api_heartbeat */
+void api_heartbeat_put(kvp_out *o, const kvp_buffer *a, const api_heartbeat *s);
+size_t api_heartbeat_size(const api_heartbeat *s, const kvp_buffer *a);
+int api_heartbeat_encode(const api_heartbeat *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len);
+int api_heartbeat_read(const kvp_buffer *b, const kvp_message *m, api_heartbeat *s);
+int api_heartbeat_decode(const kvp_buffer *b, api_heartbeat *s);
 
 /* api_query */
 void api_query_put(kvp_out *o, const kvp_buffer *a, const api_query *s);
@@ -370,6 +410,55 @@ int api_every_add_l_msg(kvp_buffer *a, api_every *s, const kvp_message *v);
 int api_every_l_msg(const kvp_buffer *b, const api_every *s, kvp_item *it, kvp_msg_st *v);
 int api_every_add_l_rec(kvp_buffer *a, api_every *s, const api_person *v);
 int api_every_l_rec(const kvp_buffer *b, const api_every *s, kvp_item *it, api_person *v);
+
+/* The message of a call to command login (1). */
+typedef struct {
+    api_login request;
+    api_login_reply reply;
+    const kvp_buffer *b; /* the buffer the request lies in */
+} api_login_msg;
+
+/* The message of a call to command ping (2). */
+typedef struct {
+    api_heartbeat request;
+    const kvp_buffer *b; /* the buffer the request lies in */
+} api_ping_msg;
+
+/* The message of a call to command query (3). */
+typedef struct {
+    api_query request;
+    api_query_reply reply;
+    const kvp_buffer *b; /* the buffer the request lies in */
+} api_query_msg;
+
+/* The message of a call to command every (4). */
+typedef struct {
+    api_every request;
+    const kvp_buffer *b; /* the buffer the request lies in */
+} api_every_msg;
+
+/* The handler: a function per command. */
+typedef struct {
+    void (*on_login)(void *app, api_login_msg *msg, void *ctx);
+    void (*on_ping)(void *app, api_ping_msg *msg, void *ctx);
+    void (*on_query)(void *app, api_query_msg *msg, void *ctx);
+    void (*on_every)(void *app, api_every_msg *msg, void *ctx);
+} api_handler;
+
+/* The multiplexer. */
+int api_dispatch(const api_handler *h, void *app, const kvp_buffer *b, void *ctx);
+
+/* A client: what carries its calls. call sends the request io holds and
+ * leaves the reply in io; it returns 0, or anything else when it failed. */
+typedef struct {
+    int (*call)(void *transport, kvp_buffer *io);
+    void *transport;
+} api_client;
+
+int api_call_login(const api_client *c, const api_login *req, const kvp_buffer *a, kvp_buffer *io, api_login_reply *reply);
+int api_call_ping(const api_client *c, const api_heartbeat *req, const kvp_buffer *a, kvp_buffer *io);
+int api_call_query(const api_client *c, const api_query *req, const kvp_buffer *a, kvp_buffer *io, api_query_reply *reply);
+int api_call_every(const api_client *c, const api_every *req, const kvp_buffer *a, kvp_buffer *io);
 
 #ifdef __cplusplus
 }

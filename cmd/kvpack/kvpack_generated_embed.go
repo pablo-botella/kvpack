@@ -22,7 +22,7 @@ var mkskillSkill string
 var MkskillSpec = mkskill.Spec{
 	Name:        "kvpack",
 	Description: "Tiny binary format that packs the data of a call (request or reply) between Go, C and Harbour programs: a command number plus typed key/value items with a crc32, 20-byte header, no transport, nothing beyond the standard library of each language, optional code generation from a .kvp declaration. Use when a Go server talks to native clients (C, Harbour, xBase++) over HTTP or a socket, as another alternative to JSON or gRPC. Covers the Go package (build, encode, decode, read from a stream), the wire format, the C and Harbour writer/reader in capi/, and the kvpack command that generates Go, C and Harbour code from a .kvp file. Triggers on kvpack, KVP messages, .kvp files, or \"binary request/response between Go and C/Harbour\" tasks.",
-	Version:     "v0.0.4",
+	Version:     "v0.0.5",
 	Readme:      mkskillReadme,
 	Agents:      mkskillAgents,
 	Skill:       mkskillSkill,

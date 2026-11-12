@@ -1,0 +1,13 @@
+# A call of the test service, in a file of its own: nullable fields and a
+# tupleset, data whose shape is only known when the message is built. Its
+# record, person, is declared in another file. Included by api.kvp.
+command query = 3
+    sql       text   = 1
+
+reply query
+    code      int32    = 1
+    note      text     = 2   nullable
+    limit     int32    = 3   optional nullable
+    author    person   = 4   nullable
+    rows      tupleset = 5
+    extra     tupleset = 6   optional

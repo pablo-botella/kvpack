@@ -1179,6 +1179,237 @@ static void test_every_key_by_key(void)
     CHECK(bad == 0);
 }
 
+/* --- the server side -----------------------------------------------------------
+ * The multiplexer generated from api.kvp (api_dispatch), with no transport:
+ * a handler of the application, the message it gets for each call, and a
+ * context the multiplexer only passes on. Here the context is where the
+ * handler leaves the bytes of what it replies, and app counts the calls.
+ */
+typedef struct {
+    uint8_t reply[256];
+    size_t  len;
+} call_ctx;
+
+static void on_login(void *app, api_login_msg *msg, void *ctx)
+{
+    call_ctx *c = (call_ctx *)ctx;
+    kvp_buffer a;
+    kvp_writer w;
+    ++*(int *)app;
+    if (!text_is(msg->b, &msg->request.password, "secret")) {
+        /* an error reply is the handler's to send */
+        kvp_begin(&w, c->reply, sizeof c->reply, API_CMD_LOGIN);
+        kvp_add_text(&w, KVP_KEY_ERROR, "wrong password");
+        kvp_end(&w, &c->len);
+        return;
+    }
+    /* the reply is there, at zero: just fill it, with an arena of our own */
+    kvp_buffer_init(&a, malloc, free, 0, 0);
+    kvp_set_text(&a, &msg->reply.name, "BOB");
+    msg->reply.expires.value = 1700000000;
+    api_login_reply_encode(&msg->reply, &a, c->reply, sizeof c->reply, &c->len);
+    kvp_buffer_free(&a);
+}
+
+static void on_ping(void *app, api_ping_msg *msg, void *ctx)
+{
+    call_ctx *c = (call_ctx *)ctx;
+    kvp_writer w;
+    (void)msg;
+    ++*(int *)app;
+    kvp_begin(&w, c->reply, sizeof c->reply, API_CMD_PING);   /* no reply declared: an empty message */
+    kvp_end(&w, &c->len);
+}
+
+static void on_query(void *app, api_query_msg *msg, void *ctx)
+{
+    call_ctx *c = (call_ctx *)ctx;
+    kvp_buffer a;
+    ++*(int *)app;
+    kvp_buffer_init(&a, malloc, free, 0, 0);
+    msg->reply.code.value = (int32_t)msg->request.sql.size;
+    kvp_tupleset_field(&a, &msg->reply.rows, KVP_INT32, "n", NULL, 0);
+    kvp_tupleset_begin(&a, &msg->reply.rows);
+    kvp_tupleset_int32(&a, &msg->reply.rows, 1);
+    kvp_tupleset_end(&a, &msg->reply.rows);
+    api_query_reply_encode(&msg->reply, &a, c->reply, sizeof c->reply, &c->len);
+    kvp_buffer_free(&a);
+}
+
+static void test_server(void)
+{
+    uint8_t buf[256];
+    size_t len = 0;
+    kvp_buffer a, b;
+    kvp_writer w;
+    kvp_message m;
+    kvp_tupledef def;
+    api_handler h;
+    api_login l;
+    api_query q;
+    api_login_reply lr;
+    api_query_reply qr;
+    call_ctx ctx;
+    char text[32];
+    int calls = 0;
+
+    h.on_login = on_login;
+    h.on_ping = on_ping;
+    h.on_query = on_query;
+    h.on_every = NULL;                                  /* a command nobody serves */
+
+    /* a call: the request is decoded into the message, the handler fills the reply */
+    kvp_buffer_init(&a, malloc, free, 0, 0);
+    memset(&l, 0, sizeof l);
+    kvp_set_text(&a, &l.user, "bob");
+    kvp_set_text(&a, &l.password, "secret");
+    OK(api_login_encode(&l, &a, buf, sizeof buf, &len));
+    kvp_buffer_wrap(&b, buf, len);
+    memset(&ctx, 0, sizeof ctx);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_OK && calls == 1);
+    kvp_buffer_wrap(&b, ctx.reply, ctx.len);
+    CHECK(api_login_reply_decode(&b, &lr) == KVP_OK && text_is(&b, &lr.name, "BOB") && lr.expires.value == 1700000000);
+    CHECK(lr.events.count == 0 && lr.owner.has == 0);   /* what the handler did not touch is empty */
+
+    /* an error reply */
+    kvp_set_text(&a, &l.password, "no");
+    OK(api_login_encode(&l, &a, buf, sizeof buf, &len));
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_OK && calls == 2);
+    kvp_buffer_wrap(&b, ctx.reply, ctx.len);
+    CHECK(api_login_reply_decode(&b, &lr) == KVP_E_REPLY);
+    CHECK(kvp_span_message(&b, &lr.kvp, &m) == KVP_OK);
+    CHECK(kvp_error_text(&m, text, sizeof text) == KVP_OK && strcmp(text, "wrong password") == 0);
+
+    /* a command with no reply */
+    kvp_begin(&w, buf, sizeof buf, API_CMD_PING);
+    kvp_end(&w, &len);
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_OK && calls == 3);
+    CHECK(kvp_parse(ctx.reply, ctx.len, &m) == KVP_OK && m.command == API_CMD_PING && m.nitems == 0);
+
+    /* a reply with a tupleset */
+    memset(&q, 0, sizeof q);
+    kvp_set_text(&a, &q.sql, "select");
+    OK(api_query_encode(&q, &a, buf, sizeof buf, &len));
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_OK && calls == 4);
+    kvp_buffer_wrap(&b, ctx.reply, ctx.len);
+    CHECK(api_query_reply_decode(&b, &qr) == KVP_OK && qr.code.value == 6 && qr.rows.nfields == 1 && qr.rows.ntuples == 1);
+    CHECK(kvp_tupleset_open(&b, &qr.kvp, API_QUERY_REPLY_ROWS, &m, &def) == KVP_OK);
+    kvp_buffer_free(&a);
+
+    /* nobody is called: a command that is none of these, one whose function
+     * is NULL, a request with a required field missing, bytes that are no
+     * message, and no handler */
+    kvp_begin(&w, buf, sizeof buf, 99);
+    kvp_end(&w, &len);
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_E_NOT_FOUND);
+    kvp_begin(&w, buf, sizeof buf, API_CMD_EVERY);
+    kvp_end(&w, &len);
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_E_NOT_FOUND);
+    kvp_begin(&w, buf, sizeof buf, API_CMD_LOGIN);
+    kvp_add_text(&w, API_LOGIN_USER, "bob");
+    kvp_end(&w, &len);
+    kvp_buffer_wrap(&b, buf, len);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_E_MISSING);
+    kvp_buffer_wrap(&b, "hello", 5);
+    CHECK(api_dispatch(&h, &calls, &b, &ctx) == KVP_E_TRUNCATED);
+    CHECK(api_dispatch(NULL, &calls, &b, &ctx) == KVP_E_ARGUMENT);
+    CHECK(api_dispatch(&h, &calls, NULL, &ctx) == KVP_E_ARGUMENT);
+    CHECK(calls == 4);
+}
+
+/* --- the client side -----------------------------------------------------------
+ * The calls generated from api.kvp (api_call_login...), over a transport
+ * that is none: it hands the request straight to the multiplexer, in memory,
+ * so the two generated sides run against each other.
+ */
+typedef struct {
+    const api_handler *h;
+    int *calls;
+} loop;
+
+static int loop_call(void *transport, kvp_buffer *io)
+{
+    loop *l = (loop *)transport;
+    call_ctx ctx;
+    kvp_buffer b;
+    kvp_buffer_wrap(&b, io->data, io->size);            /* the request, as it would arrive */
+    memset(&ctx, 0, sizeof ctx);
+    if (api_dispatch(l->h, l->calls, &b, &ctx) != KVP_OK)
+        return 1;
+    io->size = 0;                                       /* and the reply in its place */
+    return kvp_buffer_append(io, ctx.reply, ctx.len);
+}
+
+static void test_client(void)
+{
+    kvp_buffer a, io;
+    kvp_message m;
+    api_handler h;
+    api_client c;
+    loop l;
+    api_login req;
+    api_login_reply reply;
+    api_query q;
+    api_query_reply qr;
+    api_heartbeat ping;                                 /* the request of ping, as the declaration names it */
+    api_every every;
+    char text[32];
+    int calls = 0;
+
+    h.on_login = on_login;
+    h.on_ping = on_ping;
+    h.on_query = on_query;
+    h.on_every = NULL;
+    l.h = &h;
+    l.calls = &calls;
+    c.call = loop_call;
+    c.transport = &l;
+    kvp_buffer_init(&a, malloc, free, 0, 0);            /* what the requests hold */
+    kvp_buffer_init(&io, malloc, free, 0, 0);           /* the request out and the reply back */
+
+    /* a call: the request out, the reply back, both as structs */
+    memset(&req, 0, sizeof req);
+    kvp_set_text(&a, &req.user, "bob");
+    kvp_set_text(&a, &req.password, "secret");
+    CHECK(api_call_login(&c, &req, &a, &io, &reply) == KVP_OK && calls == 1);
+    CHECK(text_is(&io, &reply.name, "BOB") && reply.expires.value == 1700000000);
+
+    /* an error reply: its text is in io */
+    kvp_set_text(&a, &req.password, "no");
+    CHECK(api_call_login(&c, &req, &a, &io, &reply) == KVP_E_REPLY);
+    CHECK(kvp_parse(io.data, io.size, &m) == KVP_OK);
+    CHECK(kvp_error_text(&m, text, sizeof text) == KVP_OK && strcmp(text, "wrong password") == 0);
+
+    /* a command with no reply takes no reply argument */
+    memset(&ping, 0, sizeof ping);
+    CHECK(api_call_ping(&c, &ping, NULL, &io) == KVP_OK && calls == 3);
+
+    /* a reply with a tupleset */
+    memset(&q, 0, sizeof q);
+    kvp_set_text(&a, &q.sql, "select");
+    CHECK(api_call_query(&c, &q, &a, &io, &qr) == KVP_OK && qr.code.value == 6 && qr.rows.ntuples == 1);
+
+    /* the transport could not: here nobody serves every */
+    memset(&every, 0, sizeof every);
+    CHECK(api_call_every(&c, &every, NULL, &io) == KVP_E_CALL);
+
+    /* arguments */
+    CHECK(api_call_login(NULL, &req, &a, &io, &reply) == KVP_E_ARGUMENT);
+    CHECK(api_call_login(&c, &req, &a, NULL, &reply) == KVP_E_ARGUMENT);
+    CHECK(api_call_login(&c, &req, &a, &io, NULL) == KVP_E_ARGUMENT);
+    c.call = NULL;
+    CHECK(api_call_login(&c, &req, &a, &io, &reply) == KVP_E_ARGUMENT);
+    CHECK(calls == 4);
+
+    kvp_buffer_free(&io);
+    kvp_buffer_free(&a);
+}
+
 int main(void)
 {
     test_write_canonical();
@@ -1190,6 +1421,8 @@ int main(void)
     test_every_write();
     test_every_read();
     test_every_key_by_key();
+    test_server();
+    test_client();
     if (failures) {
         printf("kvpack generated C: %d failure(s)\n", failures);
         return 1;

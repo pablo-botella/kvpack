@@ -40,6 +40,10 @@ go get github.com/pablo-botella/kvpack
 - **Names when you want them** — declare commands, replies and records once
   in a `.kvp` file and the `kvpack` command generates Go structs, C structs
   and Harbour classes that pack, unpack and check required fields.
+- **Both ends of a call, still with no transport** — from the same file it
+  generates a multiplexer for the side that serves (it finds the command of
+  a message and calls the application's handler) and a call per command for
+  the side that asks. What carries the bytes in between is yours.
 
 ---
 

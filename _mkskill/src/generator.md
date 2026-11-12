@@ -72,6 +72,62 @@ kvpack gen -go api_kvp.go -pkg api -c api_kvp.h -hb api_kvp.prg api.kvp
 the `.ch` next to it; `-prefix` (C and Harbour names) and `-pkg` default
 to the `.kvp` file name. In a Go project it fits a `//go:generate` line.
 
+A declaration can say which **service** it is and be spread over several
+files:
+
+```
+# sqlbk.kvp
+service sqlbk
+include "sqlbk_types.kvp"
+
+command query = 1
+    sql       text     = 1
+reply query
+    results   result   = 1   list      # result is declared in sqlbk_types.kvp
+```
+
+`service` groups the commands of the file, one or more, under a name. The
+name does not travel in the messages: it is what the generated names start
+from, instead of the file name. `include` reads another file, its path
+relative to the one that includes it, into the same declaration: one
+namespace, where no name or number repeats and a type may be declared in
+any of the files. A file that declares a service is a declaration on its
+own and cannot be included.
+
+The names of what is generated can be part of the declaration too, per
+language, in `names` sections:
+
+```
+names                              # every language
+    record   result = sqlbk_record
+names go                           # Go alone
+    package         = sqlbk
+names c                            # C alone
+    command  *      = call_sqlbk_*   # call_sqlbk_query, ...
+```
+
+The header is `names [lang [side]]` (`go`, `c`, `harbour` or `*`; `server`,
+`client` or `*`), and the most specific section wins. `command`, `reply`
+and `record` name the type of a block, `*` standing for all of them;
+`package` and `prefix` are what `-pkg` and `-prefix` give on the command
+line, which still have the last word. Names are written in lowercase with
+`_` and each language dresses them its own way: `sqlbk_query` is the struct
+`SqlbkQuery` in Go, `sqlbk_query` in C and the class `SqlbkQuery` in Harbour.
+A language has one set of types, shared by a client and a server, so a type
+is named in a section with no side. The side is for `service`, which names
+the two things that do differ, the multiplexer of the server and the client
+(both described below):
+
+```
+names go server
+    service = sqlbk_service        # the multiplexer: SqlbkService, and its handler SqlbkServiceHandler
+names c client
+    service = sqlbk                # the client: sqlbk_client, and the calls sqlbk_call_<command>
+```
+
+Without it they are `Server` and `Client` in Go, where the package tells them
+apart, and take the prefix in C and Harbour.
+
 **What the generated code checks**, the same in the three languages: a
 required field that is missing, or present with another type, fails the
 decode; that is all. An optional field reads as zero when absent and is not
@@ -225,5 +281,111 @@ oR:rows:AddRow( { 2, NIL } )                   // NIL is a null
 
 ? oR:rows:aRows[ 2 ][ oR:rows:FieldPos( "name" ) ]
 ```
+
+**The server side.** A declaration with commands also gives, in the three
+languages, a **multiplexer**: the piece that takes a message that arrived,
+finds its command and hands the call to the application. It has no
+transport in it: whoever received the message calls it. Three things take
+part:
+
+- the **handler**, which is the application's: one function per command,
+  named `On` and the command. It is given to the multiplexer;
+- the **message**, which the multiplexer creates for each call: the request,
+  already unpacked, and the reply, new and empty, to fill (a command that
+  declares no reply has none);
+- the **context**: whatever the caller gives for that call. The multiplexer
+  passes it on and never looks at it.
+
+The multiplexer creates the message, unpacks the request into it and calls
+the handler; that is all. What is replied, and how it reaches the caller, is
+the handler's, with the message and the context. It calls nobody when the
+command is none of the declaration or the request misses a required field.
+
+| | handler | message | multiplexer |
+|---|---|---|---|
+| Go | interface `Handler`: `OnLogin(ctx, msg)` | `*LoginMsg`: `Request`, `Reply`, `Pack()`, `PackError(text)` | `NewServer(h).Dispatch(ctx, m)` --> `error` |
+| C | struct `api_handler` of `on_login(app, msg, ctx)` | `api_login_msg`: `request`, `reply`, `b` (the buffer the request lies in) | `api_dispatch(&h, app, &b, ctx)` --> `KVP_OK` or an error |
+| Harbour | object with `OnLogin( oMsg, oCtx )` | `ApiLoginMsg`: `request`, `reply`, `Pack()`, `Encode()`, `PackError( cText )` | `ApiServer():New( oHandler ):Dispatch( hMsg, oCtx, @nErr )` --> `.T.`/`.F.` |
+
+```go
+type MyHandler struct{}
+
+func (h *MyHandler) OnLogin(ctx context.Context, msg *api.LoginMsg) {
+    msg.Reply.Name = strings.ToUpper(msg.Request.User)   // the reply is there: just fill it
+    send(ctx, msg.Pack())                                // the context is the caller's; send is the application's
+}
+
+srv := api.NewServer(&MyHandler{})
+err := srv.Dispatch(ctx, m)                              // m: a decoded message
+```
+
+```xbase
+METHOD OnLogin( oMsg, oCtx ) CLASS MyHandler
+   oMsg:reply:name := Upper( oMsg:request:user )
+   oCtx:Send( oMsg:Encode() )
+   RETURN NIL
+
+oSrv := ApiServer():New( MyHandler():New() )
+lOk  := oSrv:Dispatch( hMsg, oCtx, @nErr )               // hMsg: a message from KvpParse
+```
+
+```c
+static void on_login(void *app, api_login_msg *msg, void *ctx)
+{
+    kvp_set_text(arena, &msg->reply.name, "ann");        /* an arena of the handler's own */
+    api_login_reply_encode(&msg->reply, arena, buf, cap, &len);
+}
+
+api_handler h = { on_login, on_ping };
+rc = api_dispatch(&h, app, &b, ctx);                     /* b: a buffer that holds the message */
+```
+
+In Go the context is a `context.Context`, in C a `void *`, in Harbour any
+value. In Harbour the multiplexer keeps, per command, the class function of
+its message (`oSrv:login`), so an application may put a class of its own
+there; in C a function left at `NULL` is a command nobody serves.
+
+Next to the code each generator writes a **skeleton of the handler**, with
+every function and, in comments, the fields of each request and reply:
+`<package>_handler-go.txt`, `<prefix>_handler-c.txt` and
+`<prefix>_handler-prg.txt`. It is valid code to copy under a name of your own
+and fill; it is written again on every run and is no part of the build.
+
+**The client side** is the mirror of it, and has no transport in it either:
+a call per command, which packs the request, hands it to whatever carries
+the call and unpacks the reply. What carries it is the application's, or a
+transport's: something that sends a message and returns the reply to it.
+
+| | what carries a call | a call |
+|---|---|---|
+| Go | interface `Caller`: `Call(ctx, req) (reply, error)` | `NewClient(c).Login(ctx, &req)` --> `(*LoginReply, error)` |
+| C | struct `api_client`: a function `call(transport, io)` and `transport` | `api_call_login(&c, &req, &a, &io, &reply)` --> `KVP_OK` or an error |
+| Harbour | any object with `Call( cRequest, @nErr )` --> the reply's bytes, or `NIL` | `ApiClient():New( oTransport ):Login( oReq, @nErr )` --> the reply object, or `NIL` |
+
+```go
+c := api.NewClient(caller)
+reply, err := c.Login(ctx, &api.Login{User: "bob", Password: "secret"})
+```
+
+```xbase
+oCli := ApiClient():New( oTransport )
+oReply := oCli:Login( oReq, @nErr )
+IF oReply == NIL .AND. nErr == KVP_E_REPLY
+   ? oCli:cError                                         // the server's own text
+ENDIF
+```
+
+```c
+api_client c = { my_call, my_transport };
+rc = api_call_login(&c, &req, &a, &io, &reply);          /* io: a growing kvp_buffer; the reply lies in it */
+```
+
+An error reply of the server is the error of the call: its text in Go, and
+`KVP_E_REPLY` in C and Harbour (the text is then in `io`, for
+`kvp_error_text`, and in `oCli:cError`). When what carries the call could not,
+Go returns its error as it is, and C and Harbour say `KVP_E_CALL`. A command
+that declares no reply returns only whether it went well. Since neither
+side knows of a transport, the two can be joined in memory, a call going
+straight into a multiplexer: that is how the tests run them.
 
 ---

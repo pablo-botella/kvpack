@@ -55,7 +55,11 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := cCheck(f, prefix); err != nil {
+	tn, err := typeNames(f, schema.C, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cCheck(f, prefix, tn); err != nil {
 		return nil, nil, err
 	}
 	P := strings.ToUpper(prefix)
@@ -65,8 +69,15 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 	hw := func(format string, a ...any) { fmt.Fprintf(&hb, format, a...) }
 	cw := func(format string, a ...any) { fmt.Fprintf(&cb, format, a...) }
 
+	sv, err := cService(f, prefix, tn)
+	if err != nil {
+		return nil, nil, err
+	}
 	hw("/* %s */\n", header(f))
 	hw("%s", cUsage)
+	if sv != nil {
+		hw("%s", cServerUsage)
+	}
 	hw("#ifndef %s\n#define %s\n\n#include \"kvp_arena.h\"\n\n", guard, guard)
 	hw("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 	hw("/* Command and record numbers. */\n")
@@ -93,10 +104,14 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 	// every struct first, so a block may hold a list of a record declared
 	// after it; then the functions
 	for _, bl := range order {
-		cStruct(hw, prefix, bl)
+		cStruct(hw, tn, bl)
 	}
 	for _, bl := range order {
-		cBlock(hw, cw, prefix, P, bl)
+		cBlock(hw, cw, tn, P, bl)
+	}
+	if sv != nil {
+		cServer(hw, cw, sv, tn, P)
+		cClient(hw, cw, sv, tn)
 	}
 	hw("\n#ifdef __cplusplus\n}\n#endif\n\n#endif /* %s */\n", guard)
 	return []byte(hb.String()), []byte(cb.String()), nil
@@ -218,7 +233,7 @@ func cOrder(f *schema.File) ([]*schema.Block, error) {
 }
 
 // cCheck refuses names C cannot take and macros that would collide.
-func cCheck(f *schema.File, prefix string) error {
+func cCheck(f *schema.File, prefix string, tn names) error {
 	P := strings.ToUpper(prefix)
 	seen := map[string]string{}
 	add := func(id, what string) error {
@@ -234,11 +249,11 @@ func cCheck(f *schema.File, prefix string) error {
 				return err
 			}
 		}
-		if err := add(prefix+"_"+blockName(bl), bl.Kind.String()+" "+bl.Name); err != nil {
+		if err := add(tn[bl], bl.Kind.String()+" "+bl.Name); err != nil {
 			return err
 		}
 		if bl.Kind == schema.Record { // the record of a field of that type
-			if err := add(prefix+"_"+bl.Name+"_st", "the field record of "+bl.Name); err != nil {
+			if err := add(tn[bl]+"_st", "the field record of "+bl.Name); err != nil {
 				return err
 			}
 		}
@@ -256,8 +271,8 @@ func cCheck(f *schema.File, prefix string) error {
 
 // cStruct writes the struct of a block and, for a record, the record a
 // field of that type is.
-func cStruct(hw func(string, ...any), prefix string, bl *schema.Block) {
-	name := prefix + "_" + blockName(bl)
+func cStruct(hw func(string, ...any), tn names, bl *schema.Block) {
+	name := tn[bl]
 	switch bl.Kind {
 	case schema.Command:
 		hw("\n/* Request of command %s (%d). */\n", bl.Name, bl.Number)
@@ -275,7 +290,7 @@ func cStruct(hw func(string, ...any), prefix string, bl *schema.Block) {
 			typ = "kvp_list_st"
 			note = fmt.Sprintf(", list: %s_add_%s, %s_%s", name, fl.Name, name, fl.Name)
 		case fl.Type == schema.Rec:
-			typ = prefix + "_" + fl.Record.Name + "_st"
+			typ = tn[fl.Record] + "_st"
 		}
 		if fl.Optional {
 			note += ", optional"
@@ -297,10 +312,10 @@ func cStruct(hw func(string, ...any), prefix string, bl *schema.Block) {
 }
 
 // cElemOut is the type a list's walk gives each element as.
-func cElemOut(prefix string, fl *schema.Field) string {
+func cElemOut(tn names, fl *schema.Field) string {
 	switch {
 	case fl.Type == schema.Rec:
-		return prefix + "_" + fl.Record.Name
+		return tn[fl.Record]
 	case cTypes[fl.Type].plain != "":
 		return cTypes[fl.Type].plain
 	}
@@ -310,7 +325,7 @@ func cElemOut(prefix string, fl *schema.Field) string {
 // cAddParam is the parameter one element is added to a list as: a scalar
 // by value, a text or bin by reference to the caller's bytes, a nested
 // message parsed, a record as its struct.
-func cAddParam(prefix string, fl *schema.Field) string {
+func cAddParam(tn names, fl *schema.Field) string {
 	switch fl.Type {
 	case schema.Text:
 		return "const kvp_utf8 *v"
@@ -319,13 +334,13 @@ func cAddParam(prefix string, fl *schema.Field) string {
 	case schema.Msg:
 		return "const kvp_message *v"
 	case schema.Rec:
-		return "const " + prefix + "_" + fl.Record.Name + " *v"
+		return "const " + tn[fl.Record] + " *v"
 	}
 	return cTypes[fl.Type].plain + " v"
 }
 
-func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
-	name := prefix + "_" + blockName(bl)
+func cBlock(hw, cw func(string, ...any), tn names, P string, bl *schema.Block) {
+	name := tn[bl]
 	hasRec, hasField := false, false
 	for _, fl := range bl.Fields {
 		if fl.List {
@@ -348,8 +363,8 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 		if !fl.List {
 			continue
 		}
-		hw("int %s_add_%s(kvp_buffer *a, %s *s, %s);\n", name, fl.Name, name, cAddParam(prefix, fl))
-		hw("int %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v);\n", name, fl.Name, name, cElemOut(prefix, fl))
+		hw("int %s_add_%s(kvp_buffer *a, %s *s, %s);\n", name, fl.Name, name, cAddParam(tn, fl))
+		hw("int %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v);\n", name, fl.Name, name, cElemOut(tn, fl))
 	}
 
 	// put
@@ -369,7 +384,7 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 			cw("    kvp_put_tupleset(o, a, %s, %s, &s->kvp, %s);\n", key, cFlags(fl), v)
 		case fl.Type == schema.Rec:
 			cw("    if (kvp_put_begin(o, %s, %s, s->%s.null, s->%s.has, &sub, %s)) {\n", key, cFlags(fl), fl.Name, fl.Name, cNum(P, fl.Record))
-			cw("        %s_%s_put(&sub, a, &s->%s.value);\n        kvp_put_end(o, &sub);\n    }\n", prefix, fl.Record.Name, fl.Name)
+			cw("        %s_put(&sub, a, &s->%s.value);\n        kvp_put_end(o, &sub);\n    }\n", tn[fl.Record], fl.Name)
 		case t.fn == "":
 			cw("    kvp_put_bytes(o, a, %s, %s, %s, %s);\n", key, t.kvp, cFlags(fl), v)
 		default:
@@ -410,7 +425,7 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 			cw("    rc = kvp_read_tupleset(m, %s, %s, %s);\n", key, cFlags(fl), v)
 		case fl.Type == schema.Rec:
 			cw("    rc = kvp_read_rec(m, %s, %s, &s->%s.null, &s->%s.has, &sub);\n", key, cFlags(fl), fl.Name, fl.Name)
-			cw("    if (rc == KVP_OK && s->%s.has)\n        rc = %s_%s_read(b, &sub, &s->%s.value);\n", fl.Name, prefix, fl.Record.Name, fl.Name)
+			cw("    if (rc == KVP_OK && s->%s.has)\n        rc = %s_read(b, &sub, &s->%s.value);\n", fl.Name, tn[fl.Record], fl.Name)
 		case t.fn == "":
 			cw("    rc = kvp_read_bytes(b, m, %s, %s, %s, %s);\n", key, t.kvp, cFlags(fl), v)
 		default:
@@ -435,7 +450,7 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 		t := cTypes[fl.Type]
 		l := "&s->" + fl.Name
 
-		cw("\nint %s_add_%s(kvp_buffer *a, %s *s, %s)\n{\n", name, fl.Name, name, cAddParam(prefix, fl))
+		cw("\nint %s_add_%s(kvp_buffer *a, %s *s, %s)\n{\n", name, fl.Name, name, cAddParam(tn, fl))
 		switch fl.Type {
 		case schema.Text, schema.Bin:
 			cw("    if (!v)\n        return KVP_E_ARGUMENT;\n")
@@ -444,7 +459,7 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 			cw("    if (!v || v->len > 0xFFFFFFFFu)\n        return KVP_E_ARGUMENT;\n")
 			cw("    return kvp_list_add(a, %s, KVP_MSG, v->buf, (uint32_t)v->len);\n", l)
 		case schema.Rec:
-			rec := prefix + "_" + fl.Record.Name
+			rec := tn[fl.Record]
 			// the element is encoded in place, in a node of the arena
 			cw("    size_t n = %s_size(v, a), len = 0;\n    kvp_off node;\n    int rc;\n", rec)
 			cw("    if (n > 0xFFFFFFFFu)\n        return KVP_E_FULL;\n")
@@ -456,7 +471,7 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 		}
 		cw("}\n")
 
-		cw("\nint %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v)\n{\n", name, fl.Name, name, cElemOut(prefix, fl))
+		cw("\nint %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v)\n{\n", name, fl.Name, name, cElemOut(tn, fl))
 		cw("    kvp_message m;\n")
 		if fl.Type == schema.Rec {
 			cw("    kvp_message sub;\n")
@@ -467,12 +482,252 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 		cw("        if (rc != KVP_OK)\n            return rc;\n")
 		switch {
 		case fl.Type == schema.Rec:
-			cw("        if (kvp_msg(it, &sub) == KVP_OK)\n            return %s_%s_read(b, &sub, v);\n", prefix, fl.Record.Name)
+			cw("        if (kvp_msg(it, &sub) == KVP_OK)\n            return %s_read(b, &sub, v);\n", tn[fl.Record])
 		case t.fn == "":
 			cw("        if (kvp_read_item(b, it, %s, v) == KVP_OK)\n            return KVP_OK;\n", t.kvp)
 		default:
 			cw("        if (%s(it, v) == KVP_OK)\n            return KVP_OK;\n", t.item)
 		}
 		cw("    }\n}\n")
+	}
+}
+
+// cSvc is what the server side of a declaration is called in C.
+type cSvc struct {
+	f        *schema.File
+	client   string            // the struct of a client
+	call     map[string]string // per command, the function that calls it
+	handler  string            // the struct of functions
+	dispatch string            // the multiplexer
+	msg      map[string]string // per command, the struct of its message
+	reply    map[string]*schema.Block
+}
+
+// cService names the server side: the handler struct, the dispatch function
+// and, per command, the struct of the message of a call. nil when the
+// declaration has no command.
+func cService(f *schema.File, prefix string, tn names) (*cSvc, error) {
+	if len(f.Commands()) == 0 {
+		return nil, nil
+	}
+	base := f.ServiceName(schema.C, "server")
+	if base == "" {
+		base = prefix
+	}
+	sv := &cSvc{f: f, handler: base + "_handler", dispatch: base + "_dispatch", msg: map[string]string{}, reply: map[string]*schema.Block{}}
+	taken := map[string]string{}
+	for b, n := range tn {
+		taken[n] = b.Kind.String() + " " + b.Name
+		if b.Kind == schema.Record {
+			taken[n+"_st"] = "the field record of " + b.Name
+		}
+	}
+	claim := func(name, what string, line int) error {
+		if o, ok := taken[name]; ok {
+			return fmt.Errorf("%s:%d: %s is called %s, the name of %s", f.Name, line, what, name, o)
+		}
+		taken[name] = what
+		return nil
+	}
+	if err := claim(sv.handler, "the handler", 1); err != nil {
+		return nil, err
+	}
+	if err := claim(sv.dispatch, "the multiplexer", 1); err != nil {
+		return nil, err
+	}
+	for _, b := range f.Replies() {
+		sv.reply[b.Name] = b
+	}
+	for _, b := range f.Commands() {
+		name := prefix + "_" + b.Name + "_msg"
+		if err := claim(name, "the message of command "+b.Name, b.Line); err != nil {
+			return nil, err
+		}
+		sv.msg[b.Name] = name
+	}
+	cbase := f.ServiceName(schema.C, "client")
+	if cbase == "" {
+		cbase = prefix
+	}
+	sv.client, sv.call = cbase+"_client", map[string]string{}
+	if err := claim(sv.client, "the client", 1); err != nil {
+		return nil, err
+	}
+	for _, b := range f.Commands() {
+		name := cbase + "_call_" + b.Name
+		if err := claim(name, "the call of command "+b.Name, b.Line); err != nil {
+			return nil, err
+		}
+		sv.call[b.Name] = name
+	}
+	return sv, nil
+}
+
+const cServerUsage = `/*
+ * The server side, with no transport in it. Three pieces:
+ *   the handler   a struct with a function per command, on_<command>(app,
+ *                 msg, ctx), and app, the application's own pointer
+ *   the message   msg, created by the multiplexer for each call:
+ *                   msg->request   the request, decoded; its texts lie in
+ *                                  msg->b, the buffer the message came in
+ *                   msg->reply     the reply, at zero, to fill (there is
+ *                                  none when the command declares no reply)
+ *                 The reply is written with its own _size and _encode, and
+ *                 an arena of the handler's for what it holds of variable
+ *                 size
+ *   the context   ctx, whatever the caller of the multiplexer gives for the
+ *                 call: it is passed on and never looked at
+ *
+ *   X_dispatch(&handler, app, &b, ctx)   b holds a message (kvp_buffer_wrap)
+ *
+ * It verifies the message, decodes the request into the message of its
+ * command and calls the handler; that is all it does. What is replied, and
+ * how it reaches the caller, is the handler's. It calls nobody and returns
+ * the error of kvp_parse when the bytes are no message, KVP_E_NOT_FOUND when
+ * the command is none of these or its function is NULL, and KVP_E_MISSING
+ * when the request misses a required field.
+ *
+ * The client side, with no transport in it either. A client is a function,
+ * call(transport, io), and transport, its own pointer: the function sends
+ * the request io holds and leaves the reply in io, returning 0, or anything
+ * else when it could not. Per command:
+ *
+ *   X_call_<command>(&client, &req, &a, &io, &reply)
+ *
+ * encodes req (its variable data in the arena a) into io, calls, and decodes
+ * the reply into reply, which refers to the bytes of io. io is a growing
+ * kvp_buffer of the caller's, other than a: what it held is gone. It returns
+ * KVP_E_CALL when the transport failed, KVP_E_REPLY when the server replied
+ * with an error (read it with kvp_error_text over io), KVP_E_MISSING when
+ * the reply misses a required field, KVP_E_FULL when there is no memory. A
+ * command that declares no reply takes no reply argument.
+ */
+
+`
+
+// cServer writes the message struct of every command, the handler struct
+// and the multiplexer.
+func cServer(hw, cw func(string, ...any), sv *cSvc, tn names, P string) {
+	cmds := sv.f.Commands()
+	for _, b := range cmds {
+		hw("\n/* The message of a call to command %s (%d). */\ntypedef struct {\n", b.Name, b.Number)
+		hw("    %s request;\n", tn[b])
+		if r := sv.reply[b.Name]; r != nil {
+			hw("    %s reply;\n", tn[r])
+		}
+		hw("    const kvp_buffer *b; /* the buffer the request lies in */\n} %s;\n", sv.msg[b.Name])
+	}
+	hw("\n/* The handler: a function per command. */\ntypedef struct {\n")
+	for _, b := range cmds {
+		hw("    void (*on_%s)(void *app, %s *msg, void *ctx);\n", b.Name, sv.msg[b.Name])
+	}
+	hw("} %s;\n", sv.handler)
+	hw("\n/* The multiplexer. */\nint %s(const %s *h, void *app, const kvp_buffer *b, void *ctx);\n", sv.dispatch, sv.handler)
+
+	// one function per command, so that only the message of the command
+	// that arrived takes room on the stack
+	for _, b := range cmds {
+		cw("\nstatic int %s_%s(const %s *h, void *app, const kvp_buffer *b, const kvp_message *m, void *ctx)\n{\n", sv.dispatch, b.Name, sv.handler)
+		cw("    %s msg;\n    int rc;\n    if (!h->on_%s)\n        return KVP_E_NOT_FOUND;\n", sv.msg[b.Name], b.Name)
+		cw("    memset(&msg, 0, sizeof msg);\n    msg.b = b;\n")
+		cw("    rc = %s_read(b, m, &msg.request);\n    if (rc != KVP_OK)\n        return rc;\n", tn[b])
+		cw("    h->on_%s(app, &msg, ctx);\n    return KVP_OK;\n}\n", b.Name)
+	}
+	cw("\nint %s(const %s *h, void *app, const kvp_buffer *b, void *ctx)\n{\n", sv.dispatch, sv.handler)
+	cw("    kvp_message m;\n    int rc;\n    if (!h || !b)\n        return KVP_E_ARGUMENT;\n")
+	cw("    rc = kvp_parse(b->data, b->size, &m);\n    if (rc != KVP_OK)\n        return rc;\n    switch (m.command) {\n")
+	for _, b := range cmds {
+		cw("    case %s:\n        return %s_%s(h, app, b, &m, ctx);\n", cNum(P, b), sv.dispatch, b.Name)
+	}
+	cw("    default:\n        break;\n    }\n    return KVP_E_NOT_FOUND;\n}\n")
+}
+
+// CHandler generates the skeleton of the handler an application writes for
+// the server side: a function per command and the struct that holds them,
+// to copy and fill. It is no part of what is compiled. hname is the header
+// of the generated code. nil when the declaration has no command.
+func CHandler(f *schema.File, prefix, hname string) ([]byte, error) {
+	tn, err := typeNames(f, schema.C, prefix)
+	if err != nil {
+		return nil, err
+	}
+	sv, err := cService(f, prefix, tn)
+	if err != nil || sv == nil {
+		return nil, err
+	}
+	var b strings.Builder
+	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+	fields := func(bl *schema.Block) string {
+		var n []string
+		for _, fl := range bl.Fields {
+			n = append(n, fl.Name)
+		}
+		if len(n) == 0 {
+			return "no fields"
+		}
+		return strings.Join(n, ", ")
+	}
+	w("/*\n * Skeleton of the handler of %s, generated by kvpack: a function per\n", baseName(f.Name))
+	w(" * command and the struct that holds them, which an application gives to\n")
+	w(" * the multiplexer. Copy it under a name of your own and fill it; this file\n")
+	w(" * is written again every time the code is generated.\n *\n")
+	w(" *   %s(&my_handler, app, &b, ctx);\n */\n", sv.dispatch)
+	w("#include \"%s\"\n", baseName(hname))
+	for _, c := range f.Commands() {
+		w("\n/* Command %s (%d).\n", c.Name, c.Number)
+		w(" *   msg->request   %s: %s\n", tn[c], fields(c))
+		if r := sv.reply[c.Name]; r != nil {
+			w(" *   msg->reply     %s, at zero, to fill: %s\n", tn[r], fields(r))
+		} else {
+			w(" *   (the command declares no reply)\n")
+		}
+		w(" *   msg->b         the buffer the request lies in\n")
+		w(" *   app, ctx       the application's own, and what the caller gave for this call */\n")
+		w("static void on_%s(void *app, %s *msg, void *ctx)\n{\n    (void)app;\n    (void)msg;\n    (void)ctx;\n}\n", c.Name, sv.msg[c.Name])
+	}
+	w("\nconst %s my_handler = {\n", sv.handler)
+	for i, c := range f.Commands() {
+		sep := ","
+		if i == len(f.Commands())-1 {
+			sep = ""
+		}
+		w("    on_%s%s\n", c.Name, sep)
+	}
+	w("};\n")
+	return []byte(b.String()), nil
+}
+
+// cClient writes the client side: the struct of a client and a function per
+// command that calls it.
+func cClient(hw, cw func(string, ...any), sv *cSvc, tn names) {
+	hw("\n/* A client: what carries its calls. call sends the request io holds and\n")
+	hw(" * leaves the reply in io; it returns 0, or anything else when it failed. */\n")
+	hw("typedef struct {\n    int (*call)(void *transport, kvp_buffer *io);\n    void *transport;\n} %s;\n\n", sv.client)
+	for _, b := range sv.f.Commands() {
+		fn, req := sv.call[b.Name], tn[b]
+		r := sv.reply[b.Name]
+		args := fmt.Sprintf("const %s *c, const %s *req, const kvp_buffer *a, kvp_buffer *io", sv.client, req)
+		if r != nil {
+			args += fmt.Sprintf(", %s *reply", tn[r])
+		}
+		hw("int %s(%s);\n", fn, args)
+		cw("\nint %s(%s)\n{\n", fn, args)
+		if r == nil {
+			cw("    kvp_message m;\n")
+		}
+		cw("    size_t n, len = 0;\n    uint8_t *p;\n    int rc;\n")
+		if r != nil {
+			cw("    if (!c || !c->call || !req || !io || !reply)\n        return KVP_E_ARGUMENT;\n")
+		} else {
+			cw("    if (!c || !c->call || !req || !io)\n        return KVP_E_ARGUMENT;\n")
+		}
+		cw("    n = %s_size(req, a);\n    io->size = 0;\n    p = kvp_buffer_lock_bytes(io, n);\n    if (!p)\n        return KVP_E_FULL;\n", req)
+		cw("    rc = %s_encode(req, a, p, n, &len);\n    if (rc != KVP_OK)\n        return rc;\n", req)
+		cw("    kvp_buffer_unlock_bytes(io, len);\n    if (c->call(c->transport, io) != 0)\n        return KVP_E_CALL;\n")
+		if r != nil {
+			cw("    return %s_decode(io, reply);\n}\n", tn[r])
+		} else {
+			cw("    rc = kvp_parse(io->data, io->size, &m);\n    if (rc != KVP_OK)\n        return rc;\n    return kvp_is_error(&m) ? KVP_E_REPLY : KVP_OK;\n}\n")
+		}
 	}
 }

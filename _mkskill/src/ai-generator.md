@@ -25,6 +25,26 @@ kvpack check api.kvp
 kvpack gen -go api_kvp.go -pkg api -c api_kvp.h -hb api_kvp.prg [-prefix api] api.kvp
 ```
 
+Outside the blocks: `service name` names the service the file declares (one
+or more commands; the name is not on the wire, it replaces the file name as
+the default of `-pkg` and `-prefix`), and `include "other.kvp"` reads
+another file, path relative to the including one, into the same
+declaration: one namespace, names and numbers unique across the files,
+types resolved after everything is read. A file with `service` cannot be
+included.
+
+`names [lang [side]]` sections (lang `go`/`c`/`harbour`/`*`, side
+`server`/`client`/`*`; omitted = any; most specific wins) name what is
+generated: `command X = name`, `reply X = name`, `record X = name` (the type
+of a block; `*` for all, with `*` in the name for each one's own),
+`package = name` (Go), `prefix = name` (C, Harbour), and `service = name`
+in a section with a side: the multiplexer (`server`) or the client
+(`client`); default `Server`/`Client` in Go, the prefix in C and Harbour.
+Lowercase with `_`,
+converted per language; a type name is whole (no prefix added) and its
+functions follow it. Types are named only in sections with no side.
+`-pkg`/`-prefix` override.
+
 - **Go:** `CmdLogin`, `RecEvent`; per block a struct (`Login`, `LoginReply`,
   `Event`) with `Pack() *kvpack.Message` and `Unpack(m) error`. Optional
   scalars are plain values (zero = absent), single records are pointers,
@@ -53,6 +73,50 @@ kvpack gen -go api_kvp.go -pkg api -c api_kvp.h -hb api_kvp.prg [-prefix api] ap
   record field holds an object of the record's class; a list of records is
   an array of them. Field names `new`, `init`, `encode`, `decode`, `error`,
   `classname` and the like are refused.
+- **Server side** (all three): a
+  multiplexer with no transport. It creates the message of the command,
+  unpacks the request into it and calls the application's handler,
+  `On<Command>`; replying is the handler's job, with the message and the
+  context (the caller's, passed through untouched). Nobody is called for
+  an unknown command or a missing required field.
+  - Go: `type Handler interface { OnLogin(ctx context.Context, msg
+    *LoginMsg) ... }`; `LoginMsg{Request Login; Reply LoginReply}` with
+    `Pack()` and `PackError(text)`; `NewServer(h).Dispatch(ctx, m) error`.
+  - C: `api_handler` (a struct of `void (*on_login)(void *app,
+    api_login_msg *msg, void *ctx)`; `NULL` = not served);
+    `api_login_msg { request; reply; b }` (`b`: the buffer the request
+    lies in; the reply is encoded with its own `_encode` and the handler's
+    arena); `api_dispatch(&h, app, &b, ctx)` --> `KVP_OK`, the error of
+    `kvp_parse`, `KVP_E_NOT_FOUND` or `KVP_E_MISSING`.
+  - Harbour: `oSrv := ApiServer():New( oHandler )`, `oSrv:Dispatch( hMsg,
+    oCtx, @nErr )` --> `.T.`/`.F.` (`KVP_E_NOT_FOUND`, `KVP_E_MISSING`);
+    handler methods `OnLogin( oMsg, oCtx )`; `oMsg` is an `ApiLoginMsg`
+    (base `KvpMsg`): `request`, `reply` (`NIL` when the command has no
+    reply), `Pack()`, `Encode()`, `PackError( cText )`.
+  Each generator also writes a handler skeleton to copy, regenerated each
+  run and not compiled: `<pkg>_handler-go.txt`, `<prefix>_handler-c.txt`,
+  `<prefix>_handler-prg.txt`.
+- **Client side** (all three), no transport in it either: a call per
+  command over whatever carries it.
+  - Go: `type Caller interface { Call(ctx, req *kvpack.Message)
+    (*kvpack.Message, error) }`; `NewClient(c).Login(ctx, &req)
+    (*LoginReply, error)`; a command with no reply returns `error`. An
+    error reply is the error, with the server's text.
+  - C: `api_client { int (*call)(void *transport, kvp_buffer *io); void
+    *transport; }`: `call` sends the request `io` holds and leaves the
+    reply in `io`, returning 0. `api_call_login(&c, &req, &a, &io,
+    &reply)` (`io`: a growing `kvp_buffer` other than the arena `a`; the
+    reply refers to it; no `reply` argument for a command with none) -->
+    `KVP_OK`, `KVP_E_CALL` (the transport failed), `KVP_E_REPLY` (read
+    the text with `kvp_error_text` over `io`), `KVP_E_MISSING`.
+  - Harbour: `oCli := ApiClient():New( oTransport )`, `oTransport` any
+    object with `Call( cRequest, @nErr )` --> reply bytes or `NIL`;
+    `oCli:Login( oReq, @nErr )` --> the reply object or `NIL` (`.T.`/`.F.`
+    for a command with no reply); `KVP_E_REPLY` with the text in
+    `oCli:cError`, `KVP_E_CALL` when the transport gave no error of its
+    own.
+  Client and server can be joined in memory (a call straight into the
+  multiplexer), which is how the tests run them.
 
 | `.kvp` | Go | C | Harbour |
 |---|---|---|---|

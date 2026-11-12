@@ -44,5 +44,6 @@
 #define KVP_E_TYPE      -9
 #define KVP_E_MISSING   -10   /* generated code: a required field is missing */
 #define KVP_E_REPLY     -11   /* generated code: the reply is an error reply */
+#define KVP_E_CALL      -12   /* generated code: the transport of a call failed */
 
 #endif /* KVPACK_CH */

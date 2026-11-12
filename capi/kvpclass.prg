@@ -6,6 +6,8 @@
  *                 per command, reply and record, with a variable per field
  *   KvpTupleSet   a tuple definition and its tuples: data whose shape is only
  *                 known when the message is built
+ *   KvpMsg        the base of the message of a call, on the server side: the
+ *                 request and its reply
  */
 #include "hbclass.ch"
 #include "kvpack.ch"
@@ -47,6 +49,49 @@ METHOD Decode( cBytes, nErr ) CLASS KvpStruct
    ENDIF
 
    RETURN ::Unpack( hMsg, @nErr )
+
+/* KvpMsg: the message of one call as the server side sees it. The
+ * multiplexer generated from a .kvp creates one per call, of the class of
+ * the command, and hands it to the application's handler:
+ *
+ *   request    the request, unpacked: an object of the command's class
+ *   reply      the reply, new and empty, for the handler to fill; NIL when
+ *              the command declares no reply
+ *   nCommand   the number of the command
+ *
+ *   METHOD OnLogin( oMsg, oCtx ) CLASS MyHandler
+ *      oMsg:reply:name := Upper( oMsg:request:user )
+ *      ... oMsg:Pack(), or oMsg:Encode(), is the reply to send
+ */
+CREATE CLASS KvpMsg
+
+   VAR nCommand INIT 0
+   VAR request
+   VAR reply
+
+   METHOD Pack()                     // --> a writer handle with the reply
+   METHOD Encode()                   // --> the bytes of the reply
+   METHOD PackError( cText )         // --> a writer handle with an error reply
+
+ENDCLASS
+
+/* Pack returns the reply as a message of the command: the fields of reply,
+ * or no items at all when the command declares no reply. */
+METHOD Pack() CLASS KvpMsg
+   RETURN iif( ::reply == NIL, KvpNew( ::nCommand ), ::reply:Pack() )
+
+METHOD Encode() CLASS KvpMsg
+   RETURN KvpEncode( ::Pack() )
+
+/* PackError returns an error reply of the command: the text under key 0,
+ * which a client reads as KVP_E_REPLY and KvpErrorText. */
+METHOD PackError( cText ) CLASS KvpMsg
+
+   LOCAL hMsg := KvpNew( ::nCommand )
+
+   KvpAddText( hMsg, KVP_KEY_ERROR, cText )
+
+   RETURN hMsg
 
 /* KvpTupleSet: the fields and the tuples.
  *

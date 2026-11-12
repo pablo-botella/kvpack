@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -125,21 +126,21 @@ func (s *LoginReply) Unpack(m *kvpack.Message) error {
 	return nil
 }
 
-// Ping is the request of command ping (2).
-type Ping struct {
+// Heartbeat is the request of command ping (2).
+type Heartbeat struct {
 }
 
 // Pack builds the message. Optional fields at their zero value are left out,
 // and what always travels goes as its empty value when left at nil.
-func (s *Ping) Pack() *kvpack.Message {
+func (s *Heartbeat) Pack() *kvpack.Message {
 	m := kvpack.New(CmdPing)
 	return m
 }
 
 // Unpack fills s from m. It fails when a required field is missing or of
 // another type.
-func (s *Ping) Unpack(m *kvpack.Message) error {
-	*s = Ping{}
+func (s *Heartbeat) Unpack(m *kvpack.Message) error {
+	*s = Heartbeat{}
 	return nil
 }
 
@@ -873,5 +874,186 @@ func (s *Every) Unpack(m *kvpack.Message) error {
 		return errors.New("every: missing r_set")
 	}
 	s.OSet, _ = m.TupleSet(52)
+	return nil
+}
+
+// The server side, with no transport in it. An application implements Handler,
+// a method per command, and gives it to a Server; whoever receives a message
+// calls Dispatch with it and with the context of that call, which only
+// travels through. Dispatch creates the message of the command, unpacks the
+// request into it and calls the handler: what is replied, and how it
+// reaches the caller, is the handler's, with the message and the context.
+
+// LoginMsg is the message of a call to command login (1): the request, unpacked,
+// and its reply, empty, to fill.
+type LoginMsg struct {
+	Request Login
+	Reply   LoginReply
+}
+
+// Pack returns the reply as a message.
+func (m *LoginMsg) Pack() *kvpack.Message { return m.Reply.Pack() }
+
+// PackError returns an error reply instead: the text under key 0.
+func (m *LoginMsg) PackError(text string) *kvpack.Message { return kvpack.NewError(CmdLogin, text) }
+
+// PingMsg is the message of a call to command ping (2): the request, unpacked.
+// The command declares no reply.
+type PingMsg struct {
+	Request Heartbeat
+}
+
+// Pack returns the reply as a message: the command's, with no items.
+func (m *PingMsg) Pack() *kvpack.Message { return kvpack.New(CmdPing) }
+
+// PackError returns an error reply instead: the text under key 0.
+func (m *PingMsg) PackError(text string) *kvpack.Message { return kvpack.NewError(CmdPing, text) }
+
+// QueryMsg is the message of a call to command query (3): the request, unpacked,
+// and its reply, empty, to fill.
+type QueryMsg struct {
+	Request Query
+	Reply   QueryReply
+}
+
+// Pack returns the reply as a message.
+func (m *QueryMsg) Pack() *kvpack.Message { return m.Reply.Pack() }
+
+// PackError returns an error reply instead: the text under key 0.
+func (m *QueryMsg) PackError(text string) *kvpack.Message { return kvpack.NewError(CmdQuery, text) }
+
+// EveryMsg is the message of a call to command every (4): the request, unpacked.
+// The command declares no reply.
+type EveryMsg struct {
+	Request Every
+}
+
+// Pack returns the reply as a message: the command's, with no items.
+func (m *EveryMsg) Pack() *kvpack.Message { return kvpack.New(CmdEvery) }
+
+// PackError returns an error reply instead: the text under key 0.
+func (m *EveryMsg) PackError(text string) *kvpack.Message { return kvpack.NewError(CmdEvery, text) }
+
+// Handler is what an application gives the multiplexer: a method per command.
+type Handler interface {
+	OnLogin(ctx context.Context, msg *LoginMsg)
+	OnPing(ctx context.Context, msg *PingMsg)
+	OnQuery(ctx context.Context, msg *QueryMsg)
+	OnEvery(ctx context.Context, msg *EveryMsg)
+}
+
+// Server is the multiplexer of service api.
+type Server struct {
+	Handler Handler
+}
+
+// NewServer returns a multiplexer that calls h.
+func NewServer(h Handler) *Server { return &Server{Handler: h} }
+
+// Dispatch hands the call m holds to the handler. It fails, calling nobody,
+// when the command is none of these or the request misses a required field.
+func (s *Server) Dispatch(ctx context.Context, m *kvpack.Message) error {
+	switch m.Command {
+	case CmdLogin:
+		msg := new(LoginMsg)
+		if err := msg.Request.Unpack(m); err != nil {
+			return err
+		}
+		s.Handler.OnLogin(ctx, msg)
+	case CmdPing:
+		msg := new(PingMsg)
+		if err := msg.Request.Unpack(m); err != nil {
+			return err
+		}
+		s.Handler.OnPing(ctx, msg)
+	case CmdQuery:
+		msg := new(QueryMsg)
+		if err := msg.Request.Unpack(m); err != nil {
+			return err
+		}
+		s.Handler.OnQuery(ctx, msg)
+	case CmdEvery:
+		msg := new(EveryMsg)
+		if err := msg.Request.Unpack(m); err != nil {
+			return err
+		}
+		s.Handler.OnEvery(ctx, msg)
+	default:
+		return fmt.Errorf("unknown command %d", m.Command)
+	}
+	return nil
+}
+
+// The client side, with no transport in it either: a Client has a method per
+// command, which packs the request, hands it to a Caller and unpacks the
+// reply.
+
+// Caller is what carries a call: it sends a message and returns the reply
+// to it. A transport is one.
+type Caller interface {
+	Call(ctx context.Context, req *kvpack.Message) (*kvpack.Message, error)
+}
+
+// Client makes the calls, over a Caller.
+type Client struct {
+	caller Caller
+}
+
+// NewClient returns a client that calls through c.
+func NewClient(c Caller) *Client { return &Client{caller: c} }
+
+// Login calls command login (1). The error is the caller's, the one of a
+// reply that misses a required field, or the server's own text when it
+// replied with an error.
+func (c *Client) Login(ctx context.Context, req *Login) (*LoginReply, error) {
+	m, err := c.caller.Call(ctx, req.Pack())
+	if err != nil {
+		return nil, err
+	}
+	reply := new(LoginReply)
+	if err := reply.Unpack(m); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
+// Ping calls command ping (2), which declares no reply. The error is the
+// caller's, or the server's own text when it replied with an error.
+func (c *Client) Ping(ctx context.Context, req *Heartbeat) error {
+	m, err := c.caller.Call(ctx, req.Pack())
+	if err != nil {
+		return err
+	}
+	if text, bad := m.ErrorText(); bad {
+		return errors.New(text)
+	}
+	return nil
+}
+
+// Query calls command query (3). The error is the caller's, the one of a
+// reply that misses a required field, or the server's own text when it
+// replied with an error.
+func (c *Client) Query(ctx context.Context, req *Query) (*QueryReply, error) {
+	m, err := c.caller.Call(ctx, req.Pack())
+	if err != nil {
+		return nil, err
+	}
+	reply := new(QueryReply)
+	if err := reply.Unpack(m); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
+// Every calls command every (4), which declares no reply. The error is the
+// caller's, or the server's own text when it replied with an error.
+func (c *Client) Every(ctx context.Context, req *Every) error {
+	m, err := c.caller.Call(ctx, req.Pack())
+	if err != nil {
+		return err
+	}
+	if text, bad := m.ErrorText(); bad {
+		return errors.New(text)
+	}
 	return nil
 }
