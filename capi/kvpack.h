@@ -21,7 +21,8 @@
  *   DATA (size bytes): nitems items, back to back:
  *     key       uint16  application key; 0 is reserved for an error text
  *     type      uint16  KVP_INT32 1, KVP_INT64 2, KVP_TS 3, KVP_TEXT 4, KVP_BIN 5, KVP_MSG 6,
- *                       KVP_BOOL 7, KVP_FLOAT64 8, KVP_DS 9
+ *                       KVP_BOOL 7, KVP_FLOAT64 8, KVP_DS 9, KVP_NULL 10,
+ *                       KVP_TUPLEDEF 11, KVP_TUPLE 12
  *     size      uint32  byte length of value
  *     value     size bytes
  *
@@ -32,8 +33,29 @@
  * 8 bytes IEEE 754, ds 8 ASCII digits yyyymmdd (a calendar day, as
  * Harbour's DToS writes it), 8 spaces for the null date -- and, as with
  * SToD, anything that is not a real day reads as the null date; in C a ds is an int32_t
- * yyyymmdd, 0 for the null date. A key may repeat (a list). A reply
- * carrying key 0 as text is an error reply.
+ * yyyymmdd, 0 for the null date. null has no value (size 0): the key is
+ * there and says "no value", which is not a zero, an empty text or an
+ * absent key. A key may repeat (a list). A reply carrying key 0 as text is
+ * an error reply.
+ *
+ * Tuples carry data whose shape is only known when the message is built
+ * (the rows of a query): a structure declared on the fly and then repeated.
+ * Under one key go a tupledef, the definition, and right after it zero or
+ * more tuples, each holding only values in the order of the definition:
+ *
+ *   tupledef value:  nfields uint32, then per field
+ *                    type uint16 | name size uint32 | name | meta size uint32 | meta
+ *   tuple value:     per field of the definition, in order
+ *                    type uint16 | size uint32 | value
+ *
+ * The name is UTF-8; the meta is the application's, raw bytes never looked
+ * at. A field takes any value type (int32 to ds); a tuple holds no tuples.
+ * In a tuple each value says its type again: the one the definition
+ * declares for the field, or KVP_NULL (size 0) when the field is null.
+ * The order is strict: at most one tupledef per key, a tuple right after
+ * its tupledef or another tuple of the same key, and every tuple with
+ * exactly the fields of the definition, each of its type and the size that
+ * type demands, or null. kvp_parse refuses anything else.
  *
  * Writing:
  *
@@ -94,6 +116,16 @@ extern "C" {
 #define KVP_BOOL   7           /* 1 byte: 0 or 1 */
 #define KVP_FLOAT64 8          /* 8 bytes, IEEE 754 */
 #define KVP_DS     9           /* 8 ASCII digits yyyymmdd (DToS); 8 spaces = null date */
+#define KVP_NULL   10          /* no value: size 0 */
+#define KVP_TUPLEDEF 11        /* the definition of the tuples that follow it under its key */
+#define KVP_TUPLE  12          /* a tuple: the values of the fields of its definition */
+
+#define KVP_TUPLE_FIELD_SIZE 6       /* type and size before each value of a tuple */
+
+/* As the size of a field's meta: the meta is a NUL-terminated string, to be
+ * measured (the terminator does not travel). It is (uint32_t)-1, which no
+ * real meta can measure. */
+#define KVP_STRLEN 0xFFFFFFFFu
 
 typedef enum {
     KVP_OK          =  0,
@@ -139,6 +171,12 @@ typedef struct {
     size_t   len;               /* bytes used so far, header included */
     uint32_t nitems;
     int      error;             /* first error, or KVP_OK */
+    /* tuples: the definition last written (a tuple may follow it) or, in
+     * the writer of a tuple, the one its fields are checked against */
+    const uint8_t *def;
+    uint32_t def_size;
+    uint32_t def_pos;
+    uint16_t def_key;
 } kvp_writer;
 
 /* kvp_room is the buffer size a message with nitems items and
@@ -160,6 +198,8 @@ int kvp_add_float64(kvp_writer *w, uint16_t key, double v);
 /* kvp_add_ds takes yyyymmdd; 0, or anything that is no calendar day of the
  * years 1..9999, is written as the null date (8 spaces). */
 int kvp_add_ds(kvp_writer *w, uint16_t key, int32_t yyyymmdd);
+/* kvp_add_null adds a null: the key is present and has no value. */
+int kvp_add_null(kvp_writer *w, uint16_t key);
 /* kvp_add_utf8 adds a text of t->len bytes (no terminator needed). */
 int kvp_add_utf8(kvp_writer *w, uint16_t key, const kvp_utf8 *t);
 /* kvp_begin_msg opens a nested message under key, written in place inside
@@ -167,6 +207,36 @@ int kvp_add_utf8(kvp_writer *w, uint16_t key, const kvp_utf8 *t);
  * kvp_end_msg closes it into w. Nothing may be added to w in between. */
 int kvp_begin_msg(kvp_writer *w, uint16_t key, kvp_writer *sub, uint32_t command);
 int kvp_end_msg(kvp_writer *w, kvp_writer *sub);
+/* Tuples. A definition is opened under key with kvp_begin_tupledef (def is
+ * a writer of its own, used only with kvp_tupledef_add), given its fields
+ * in order (type KVP_INT32..KVP_DS, a name, and a meta of meta_size raw
+ * bytes that may be NULL, 0 -- or, for a meta that is a NUL-terminated
+ * string, KVP_STRLEN as its size) and closed with kvp_end_tupledef. Each tuple
+ * is then opened with kvp_begin_tuple under the same key (row is a writer
+ * used only with the kvp_tuple_* functions), given one value per field in
+ * the order of the definition -- kvp_tuple_null for a null -- and closed
+ * with kvp_end_tuple. Nothing else may be added to w while one is open, and
+ * the tuples must follow their definition with no other item in between.
+ * The writer holds to the order a reader demands: KVP_E_FORMAT for a second
+ * definition under a key, a tuple that does not follow its definition, or
+ * one with fewer or more values than fields; KVP_E_TYPE for a value of
+ * another type than its field. */
+int kvp_begin_tupledef(kvp_writer *w, uint16_t key, kvp_writer *def);
+int kvp_tupledef_add(kvp_writer *def, uint16_t type, const char *name, const void *meta, uint32_t meta_size);
+int kvp_end_tupledef(kvp_writer *w, kvp_writer *def);
+int kvp_begin_tuple(kvp_writer *w, uint16_t key, kvp_writer *row);
+int kvp_tuple_int32(kvp_writer *row, int32_t v);
+int kvp_tuple_int64(kvp_writer *row, int64_t v);
+int kvp_tuple_ts(kvp_writer *row, int64_t unix_seconds);
+int kvp_tuple_text(kvp_writer *row, const char *utf8);
+int kvp_tuple_utf8(kvp_writer *row, const kvp_utf8 *t);
+int kvp_tuple_bin(kvp_writer *row, const void *bytes, uint32_t size);
+int kvp_tuple_msg(kvp_writer *row, const void *msg, size_t len);
+int kvp_tuple_bool(kvp_writer *row, int v);
+int kvp_tuple_float64(kvp_writer *row, double v);
+int kvp_tuple_ds(kvp_writer *row, int32_t yyyymmdd);
+int kvp_tuple_null(kvp_writer *row);
+int kvp_end_tuple(kvp_writer *w, kvp_writer *row);
 /* kvp_end seals nitems, size and crc32 in the header and gives the total
  * length; after it the buffer holds the message. */
 int kvp_end(kvp_writer *w, size_t *len);
@@ -193,6 +263,22 @@ typedef struct {
     const uint8_t *value;
     size_t         pos;
 } kvp_item;
+
+/* A tuple definition as read: points into the message. item is the item
+ * it came from, where the walk of its tuples starts. */
+typedef struct {
+    const uint8_t *buf;         /* the tupledef value */
+    uint32_t       size;
+    uint32_t       nfields;
+    kvp_item       item;
+} kvp_tupledef;
+
+/* One field of a definition: name and meta point into the message. */
+typedef struct {
+    uint16_t  type;
+    kvp_utf8  name;
+    kvp_bytes meta;             /* the application's; may be empty */
+} kvp_field;
 
 /* kvp_header reads only the header: magic and version are checked and
  * m->size says how many bytes follow, so a stream reader knows how much to
@@ -239,6 +325,34 @@ int kvp_get_utf8(const kvp_message *m, uint16_t key, kvp_utf8 *t);
 int kvp_get_bool(const kvp_message *m, uint16_t key, int *v);
 int kvp_get_float64(const kvp_message *m, uint16_t key, double *v);
 int kvp_get_ds(const kvp_message *m, uint16_t key, int32_t *yyyymmdd);
+/* kvp_is_null says 1 when the first item with key is a null, 0 otherwise
+ * (absent is not null). An item of the walk is a null when its type is
+ * KVP_NULL; the typed readers give KVP_E_TYPE on it, as on any other type. */
+int kvp_is_null(const kvp_message *m, uint16_t key);
+
+/* Reading tuples. kvp_get_tupledef finds the definition under key
+ * (KVP_E_NOT_FOUND when the key holds none) and kvp_tupledef_of takes it
+ * from a walked item (KVP_E_TYPE when the item is something else). kvp_tupledef_field gives
+ * the field at index (0-based; KVP_E_NOT_FOUND past the last). The tuples
+ * are walked from the definition's own item:
+ *
+ *   kvp_tupledef def;
+ *   kvp_item row, f;
+ *   if (kvp_get_tupledef(&m, K_ROWS, &def) == KVP_OK)
+ *       for (row = def.item; kvp_tuple_next(&m, &row) == KVP_OK; )
+ *           if (kvp_tuple_field(&def, &row, 0, &f) == KVP_OK) ...
+ *
+ * kvp_tuple_next moves it to the next item when that is a tuple of the
+ * same key, and says KVP_E_NOT_FOUND when the tuples are over.
+ * kvp_tuple_field gives the field at index of a tuple as an item, to read
+ * with kvp_int32, kvp_item_utf8, kvp_bin... as any other: its key is the
+ * position (1-based) and its type the one the definition declares, or
+ * KVP_NULL when the field is null (the typed readers then say KVP_E_TYPE). */
+int kvp_tupledef_of(const kvp_item *it, kvp_tupledef *def);
+int kvp_get_tupledef(const kvp_message *m, uint16_t key, kvp_tupledef *def);
+int kvp_tupledef_field(const kvp_tupledef *def, uint32_t index, kvp_field *f);
+int kvp_tuple_next(const kvp_message *m, kvp_item *it);
+int kvp_tuple_field(const kvp_tupledef *def, const kvp_item *row, uint32_t index, kvp_item *field);
 
 /* kvp_error_text copies the text of an error reply (key KVP_KEY_ERROR)
  * into dst; KVP_E_NOT_FOUND when the message is not an error. kvp_is_error

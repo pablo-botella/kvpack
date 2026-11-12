@@ -28,3 +28,77 @@ record event = 100
 
 record person = 101
     name      text   = 1
+
+# Nullable fields and a tupleset: data whose shape is only known when the
+# message is built.
+command query = 3
+    sql       text   = 1
+
+reply query
+    code      int32    = 1
+    note      text     = 2   nullable
+    limit     int32    = 3   optional nullable
+    author    person   = 4   nullable
+    rows      tupleset = 5
+    extra     tupleset = 6   optional
+
+# Every type in every form a field can take: r_ required, o_ optional,
+# n_ nullable, on_ optional nullable and l_ list; and the two a tupleset has.
+command every = 4
+    r_int32     int32    = 1
+    r_int64     int64    = 2
+    r_ts        ts       = 3
+    r_text      text     = 4
+    r_bin       bin      = 5
+    r_bool      bool     = 6
+    r_float64   float64  = 7
+    r_ds        ds       = 8
+    r_msg       msg      = 9
+    r_rec       person   = 10
+
+    o_int32     int32    = 11  optional
+    o_int64     int64    = 12  optional
+    o_ts        ts       = 13  optional
+    o_text      text     = 14  optional
+    o_bin       bin      = 15  optional
+    o_bool      bool     = 16  optional
+    o_float64   float64  = 17  optional
+    o_ds        ds       = 18  optional
+    o_msg       msg      = 19  optional
+    o_rec       person   = 20  optional
+
+    n_int32     int32    = 21  nullable
+    n_int64     int64    = 22  nullable
+    n_ts        ts       = 23  nullable
+    n_text      text     = 24  nullable
+    n_bin       bin      = 25  nullable
+    n_bool      bool     = 26  nullable
+    n_float64   float64  = 27  nullable
+    n_ds        ds       = 28  nullable
+    n_msg       msg      = 29  nullable
+    n_rec       person   = 30  nullable
+
+    on_int32    int32    = 31  optional nullable
+    on_int64    int64    = 32  optional nullable
+    on_ts       ts       = 33  optional nullable
+    on_text     text     = 34  optional nullable
+    on_bin      bin      = 35  optional nullable
+    on_bool     bool     = 36  optional nullable
+    on_float64  float64  = 37  optional nullable
+    on_ds       ds       = 38  optional nullable
+    on_msg      msg      = 39  optional nullable
+    on_rec      person   = 40  optional nullable
+
+    l_int32     int32    = 41  list
+    l_int64     int64    = 42  list
+    l_ts        ts       = 43  list
+    l_text      text     = 44  list
+    l_bin       bin      = 45  list
+    l_bool      bool     = 46  list
+    l_float64   float64  = 47  list
+    l_ds        ds       = 48  list
+    l_msg       msg      = 49  list
+    l_rec       person   = 50  list
+
+    r_set       tupleset = 51
+    o_set       tupleset = 52  optional

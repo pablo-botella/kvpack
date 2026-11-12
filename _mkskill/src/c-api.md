@@ -15,6 +15,14 @@ the Go package produces.
   beyond the C standard library, **no allocation**: the writer fills a
   buffer the caller provides, the reader points into the bytes the caller
   received. MSVC, MinGW, gcc, clang; 32 or 64 bit.
+- `dyn_buffer.h` / `kvp_arena.h` (and their `.c`) — optional, for when
+  the size of a message is not known in advance: a buffer that grows
+  through the `malloc` and `free` the application hands in, and over it
+  messages as fixed structs whose variable data lives in that one block.
+  The C code generated from a `.kvp` is built on them.
+- `kvpclass.prg` — Harbour classes over the wrapper: `KvpTupleSet` (the
+  fields and a two-dimensional array of tuples) and `KvpStruct`, the base
+  of the classes generated from a `.kvp`.
 - `hbkvpack.c` / `kvpack.ch` — the Harbour wrapper over the C code:
   handles released by the garbage collector, `KvpGet` returning the value
   typed by the item (numeric, string or a nested handle).

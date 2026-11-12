@@ -6,12 +6,15 @@
 reply) between **Go**, **C** and **Harbour** programs: a `uint32` command
 plus a flat list of typed key/value items (`uint16` key, `uint16` type,
 `uint32` size, value), with a crc32 over the payload. 20-byte header, 8
-bytes per item, little-endian. No transport, no dependencies; code
+bytes per item, little-endian. No transport, nothing beyond the standard
+library of each language; code
 generation from a `.kvp` declaration is optional.
 
-Module: `github.com/pablo-botella/kvpack` — standard library only. The
-C writer/reader (ANSI C, no allocation) and the Harbour wrapper live in
-`capi/`; all three implementations are tested against one canonical message.
+Module: `github.com/pablo-botella/kvpack`. The package imports only the
+standard library; the `kvpack` command, in the same module, also uses
+`mkskill` for its embedded docs. The C writer/reader (ANSI C; `kvpack.c`
+allocates nothing) and the Harbour wrapper live in `capi/`; all three
+implementations are tested against the same canonical messages.
 
 ```sh
 go get github.com/pablo-botella/kvpack
@@ -24,8 +27,13 @@ go get github.com/pablo-botella/kvpack
   out, `Decode`/`Read` in).
 - Replies that carry records and lists: nest a message as a value (`Msg`)
   and repeat the key.
-- Any place JSON is too loose and gRPC/protobuf too heavy for a handful of
-  typed fields.
+- A handful of typed fields, or query results, where JSON is too loose and
+  a standard format such as Protocol Buffers has no binding for one of the
+  languages involved (Harbour).
+
+It is an alternative for that case, not a replacement for a standard: it is
+not smaller than Protocol Buffers and has not been benchmarked. Where the
+languages are well served by a standard format, prefer the standard.
 
 ### Types
 
@@ -40,6 +48,27 @@ go get github.com/pablo-botella/kvpack
 | `Bool` (7) | `AddBool` / `Bool` | 1 byte, 0 or 1 |
 | `Float64` (8) | `AddFloat64` / `Float64` | 8 bytes IEEE 754 |
 | `Date` (9) | `AddDate` / `Date` | 8 ASCII digits `yyyymmdd` (`ds`, Harbour `DToS`); 8 spaces = null date, and anything malformed reads as null (`SToD`) |
+| `Null` (10) | `AddNull` / `IsNull` | nothing, size 0: the key is present and has no value; the typed getters say `false` on it |
+| `TupDef` (11), `Tup` (12) | `AddTupleSet` / `TupleSet` | a definition (per field: type, name, opaque meta) and right after it, under the same key, its tuples (per field: type + size + value; a null field is the type `Null` with size 0) |
+
+### Tuples (shape known only at run time)
+
+Use them for the rows of a query or anything else whose fields the code
+does not know in advance; use a record (`Msg`) when the shape is fixed.
+
+```go
+def := kvpack.NewTupleDef().Field("id", kvpack.Int32).FieldMeta("name", kvpack.Text, []byte("len=40"))
+ts := kvpack.NewTupleSet(def)
+err := ts.Add(int32(1), "Ana")      // one value per field, in order; nil = null
+m.AddTupleSet(21, ts)
+
+got, ok := m.TupleSet(21)           // got.Def.Fields[i].Name/.Type/.Meta, got.Rows [][]any
+```
+
+The order is strict and `Decode` enforces it: one definition per key, its
+tuples right after it with nothing in between, every tuple with exactly the
+fields of the definition. Fields are value types only (`Int32`..`Date`): no
+tuples inside tuples. The meta is the application's, never interpreted.
 
 Key `0` (`KeyError`) is reserved: a reply with a `Text` under it is an
 error reply (`NewError`, `ErrorText`, `IsError`).
@@ -120,7 +149,7 @@ constants when a project has more than a couple of commands.
 
 ```
 command login = 1              # header: command name = number
-    user      text   = 1       # field: name type = key [list | optional]
+    user      text   = 1       # field: name type = key [list | optional] [nullable]
     when      ts     = 3   optional
 reply login                    # takes command login's number
     events    event  = 3   list
@@ -137,29 +166,71 @@ kvpack gen -go api_kvp.go -pkg api -c api_kvp.h -hb api_kvp.prg [-prefix api] ap
   `Event`) with `Pack() *kvpack.Message` and `Unpack(m) error`. Optional
   scalars are plain values (zero = absent), single records are pointers,
   lists are slices.
-- **C:** `API_CMD_LOGIN`, keys `API_LOGIN_USER`; `api_login` with
-  `_encode`/`_decode`, `_write`/`_read`, per list `_add_<f>`, `_begin_<f>`
-  (record element left open) and the walk `_<f>(&s, &it, &v)` (zero `it`
-  first). Text is `kvp_utf8` and bin `kvp_bytes`, both pointing into the
-  decoded bytes; an optional record has `has_<f>`.
-- **Harbour:** `ApiLoginEncode( hS )`, `ApiLoginPack( hS )`,
-  `ApiLoginDecode( cBytes, @nErr )`, `ApiLoginUnpack( hMsg, @nErr )` over
-  hashes keyed by field name.
+- **C:** `API_CMD_LOGIN`, keys `API_LOGIN_USER`; a fixed-size struct
+  `api_login` over `kvp_arena.h` (compile `kvpack.c`, `dyn_buffer.c`,
+  `kvp_arena.c`). Members are records: scalars `{ null, value }` assigned
+  directly; text/bin/msg `{ null, size, off }` set with `kvp_set_text` /
+  `kvp_set_bytes(&a, &s.f, ...)` and read with `kvp_st_ptr(&b, &s.f)`;
+  records `{ null, has, value }`. Variable data lives in an arena, a
+  `kvp_buffer` (`kvp_buffer_init(&a, malloc, free, 0, 0)` …
+  `kvp_buffer_free(&a)`), by offset. `memset` the struct to zero first.
+  Functions: `_size(&s, &a)` (exact message size), `_encode(&s, &a, buf,
+  cap, &len)`, `_decode(&b, &s)` over a buffer holding the message
+  (`kvp_buffer_wrap(&b, bytes, n)`, nothing copied), per list
+  `_add_<f>(&a, &s, v)` and the walk `_<f>(&b, &s, &it, &v)` of a decoded
+  struct (zero `it` first). A decoded struct encodes again, with the
+  buffer it was decoded from, to the same bytes.
+- **Harbour:** a class per block inheriting `KvpStruct` (link
+  `capi/kvpclass.prg` with `kvpack.c` and `hbkvpack.c`): `o :=
+  ApiLogin():New()`, a variable per field (`o:user := "bob"`),
+  `o:Encode()` --> bytes, `o:Decode( cBytes, @nErr )` --> `.T.`/`.F.`, and
+  `o:Pack()` / `o:Unpack( hMsg, @nErr )` over handles. Variables start at
+  the empty value of their type: records, `msg` and tuplesets are created
+  empty by `New()` (only an optional record or `msg` starts `NIL`). A
+  record field holds an object of the record's class; a list of records is
+  an array of them. Field names `new`, `init`, `encode`, `decode`, `error`,
+  `classname` and the like are refused.
 
 | `.kvp` | Go | C | Harbour |
 |---|---|---|---|
-| `int32` / `int64` | `int32` / `int64` | `int32_t` / `int64_t` | numeric |
-| `ts` | `time.Time` | `int64_t` (Unix seconds) | numeric (Unix seconds) |
-| `text` | `string` | `kvp_utf8` | string |
-| `bin` | `[]byte` | `kvp_bytes` | string |
-| `bool` | `bool` | `int` | logical |
-| `float64` | `float64` | `double` | numeric |
-| `ds` | `time.Time` (zero = null date) | `int32_t` `yyyymmdd` (0 = null) | date (empty = null) |
-| `msg` | `*kvpack.Message` | `kvp_message` | handle |
-| record | `*Rec` (`[]Rec` in a list) | struct by value (+ `has_<f>` if optional) | hash |
+| `int32` / `int64` | `int32` / `int64` | `kvp_int32_st` / `kvp_int64_st` | numeric |
+| `ts` | `time.Time` | `kvp_ts_st` (Unix seconds) | numeric (Unix seconds) |
+| `text` | `string` | `kvp_text_st` | string |
+| `bin` | `[]byte` | `kvp_bin_st` | string |
+| `bool` | `bool` | `kvp_bool_st` | logical |
+| `float64` | `float64` | `kvp_float64_st` | numeric |
+| `ds` | `time.Time` (zero = null date) | `kvp_ds_st` `yyyymmdd` (0 = null date) | date (empty = null) |
+| `msg` | `*kvpack.Message` | `kvp_msg_st` (encoded bytes; `kvp_st_msg` parses) | handle |
+| record | `*Rec` (`[]Rec` in a list) | `<prefix>_<rec>_st`: `{ null, has, value }` | object of class `<Prefix><Rec>` |
+| list | slice | `kvp_list_st` (`count`; `_add_<f>`, walk `_<f>`) | array |
+| `tupleset` | `*kvpack.TupleSet` | `kvp_tupleset_st` (`nfields`, `ntuples`); built with `kvp_tupleset_field` / `_begin` / `_int32`… / `_null` / `_end(&a, &s.f)`, read with `kvp_tupleset_open(&b, &s.kvp, KEY, &m, &def)` then `kvp_tuple_next` / `kvp_tuple_field` | `KvpTupleSet` object: `aFields` `{ { cName, nType, cMeta }, ... }`, `aRows` (array of arrays, `NIL` = null), `AddField`, `AddRow`, `FieldPos` |
+
+Modifiers: `optional`, `list` (the key repeats), `nullable` (the key may
+hold a null instead of a value: Go `<Field>Null bool`, C the record's
+`null`, Harbour `NIL`). They decide when a field is written:
+
+| declared | written | when it does not arrive |
+|---|---|---|
+| (nothing) | always | decode fails |
+| `optional` | when not empty (zero, no bytes) | reads empty |
+| `nullable` | always, as value or as null | decode fails |
+| `optional nullable` | when not null (a zero IS written) | reads null |
+
+`nullable` goes with neither `list` nor `tupleset`. A `tupleset` declares
+no fields — the definition travels in the message — and takes `optional`
+only.
+
+Empty values: zero, no bytes, false, null date, a message of command 0 and
+no items, a record of empty fields, a tuple definition of no fields. A field
+nobody set holds its empty value, so a struct that was only created (Go zero
+value, with `nil` pointers; C `memset` to zero; Harbour `New()`) writes the
+same bytes in the three languages: every non-optional field as its empty
+value. An optional tupleset of no fields is not written and an absent one
+reads as no fields. A record that always holds itself (through fields that
+are neither optional nor lists) is refused.
 
 Rules: a decode fails only when a required field is missing or of another
-type (Go: an error naming it; C and Harbour: `KVP_E_MISSING`); a reply with
+type — a null counts as another type unless the field is `nullable` (Go: an error naming it; C and Harbour: `KVP_E_MISSING`); a reply with
 key 0 is an error reply (Go: the error is the server's text; C and Harbour:
 `KVP_E_REPLY`). Unknown keys are ignored. Never edit the generated files:
 change the `.kvp` and regenerate.
@@ -198,7 +269,8 @@ change the `.kvp` and regenerate.
   takes a NUL-terminated UTF-8 string; the C reader copies with a terminator
   and reports `KVP_E_FULL` when truncated. Harbour passes bytes through:
   convert with `hb_UTF8ToStr`/`hb_StrToUTF8` as needed.
-- **The C side allocates nothing.** `kvp_begin` needs a buffer sized with
+- **`kvpack.c` allocates nothing** (the arena of the generated C structs
+  does, through the application's `malloc`). `kvp_begin` needs a buffer sized with
   `kvp_room(nitems, value_bytes)`; a parsed `kvp_message` points into the
   caller's bytes, which must stay valid. The Harbour wrapper copies and the
   garbage collector frees.

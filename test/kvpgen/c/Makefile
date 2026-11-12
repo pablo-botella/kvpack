@@ -11,8 +11,10 @@ EXE     := test_api$(if $(findstring Windows_NT,$(OS)),.exe,)
 all: $(EXE)
 	./$(EXE)
 
-$(EXE): $(CAPI)/kvpack.c api_kvp.c test_api.c api_kvp.h $(CAPI)/kvpack.h
-	$(CC) $(CFLAGS) -I$(CAPI) -o $@ $(CAPI)/kvpack.c api_kvp.c test_api.c $(LDFLAGS)
+LIB     = $(CAPI)/kvpack.c $(CAPI)/dyn_buffer.c $(CAPI)/kvp_arena.c
+
+$(EXE): $(LIB) api_kvp.c test_api.c api_kvp.h $(CAPI)/kvpack.h $(CAPI)/dyn_buffer.h $(CAPI)/kvp_arena.h
+	$(CC) $(CFLAGS) -I$(CAPI) -o $@ $(LIB) api_kvp.c test_api.c $(LDFLAGS)
 
 clean:
 	rm -f $(EXE) *.o *.obj

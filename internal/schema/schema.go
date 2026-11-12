@@ -15,8 +15,11 @@
 //
 // A header (command, reply, record) opens a block and the fields that
 // follow belong to it; indentation is only for the eye. A field is
-// "name type = key [list | optional]". A reply takes the number of its
-// command. Fields are required unless marked optional; a list may be empty.
+// "name type = key [list | optional] [nullable]". A reply takes the number
+// of its command. Fields are required unless marked optional; a list may be
+// empty. A nullable field may arrive as a null instead of a value. The type
+// tupleset is a tuple definition and its tuples, whose shape is only known
+// when the message is built.
 package schema
 
 import (
@@ -60,11 +63,14 @@ const (
 	Bool    = "bool"
 	Float64 = "float64"
 	DS      = "ds"
-	Rec     = "record"
+	// TupleSet is a tuple definition followed by its tuples, all under the
+	// field's key: data whose shape is only known when the message is built.
+	TupleSet = "tupleset"
+	Rec      = "record"
 )
 
 var baseTypes = map[string]bool{Int32: true, Int64: true, TS: true, Text: true, Bin: true, Msg: true,
-	Bool: true, Float64: true, DS: true}
+	Bool: true, Float64: true, DS: true, TupleSet: true}
 
 // Field is one declared item.
 type Field struct {
@@ -74,12 +80,17 @@ type Field struct {
 	Key      uint16
 	List     bool // repeated key, zero or more
 	Optional bool // may be absent
+	Nullable bool // may arrive as a null instead of a value
 	Line     int
 	typeName string // as written, resolved after the whole file is read
 }
 
 // Required reports whether a decoder must find the field.
 func (f *Field) Required() bool { return !f.List && !f.Optional }
+
+// Late reports whether the field is written after the single ones: a list
+// or a tupleset, which take several items under their key.
+func (f *Field) Late() bool { return f.List || f.Type == TupleSet }
 
 // Block is a command, a reply or a record.
 type Block struct {
@@ -188,7 +199,7 @@ func Parse(name string, r io.Reader) (*File, error) {
 
 func parseField(tok []string, line int) (*Field, error) {
 	if len(tok) < 4 || tok[2] != "=" {
-		return nil, fmt.Errorf("expected %q", "name type = key [list | optional]")
+		return nil, fmt.Errorf("expected %q", "name type = key [list | optional] [nullable]")
 	}
 	fl := &Field{Name: tok[0], typeName: tok[1], Line: line}
 	if !nameRe.MatchString(fl.Name) {
@@ -208,12 +219,23 @@ func parseField(tok []string, line int) (*Field, error) {
 			fl.List = true
 		case "optional":
 			fl.Optional = true
+		case "nullable":
+			fl.Nullable = true
 		default:
-			return nil, fmt.Errorf("field %s: unknown modifier %q (list or optional)", fl.Name, mod)
+			return nil, fmt.Errorf("field %s: unknown modifier %q (list, optional or nullable)", fl.Name, mod)
 		}
 	}
 	if fl.List && fl.Optional {
 		return nil, fmt.Errorf("field %s: a list is already optional", fl.Name)
+	}
+	if fl.List && fl.Nullable {
+		return nil, fmt.Errorf("field %s: a list cannot be nullable", fl.Name)
+	}
+	if fl.typeName == TupleSet && fl.List {
+		return nil, fmt.Errorf("field %s: a tupleset is already a list", fl.Name)
+	}
+	if fl.typeName == TupleSet && fl.Nullable {
+		return nil, fmt.Errorf("field %s: a tupleset cannot be nullable", fl.Name)
 	}
 	return fl, nil
 }
@@ -282,8 +304,14 @@ func (f *File) check() error {
 			fl.Type = Rec
 			fl.Record = r
 		}
+		for _, fl := range b.Fields {
+			if o := fields[fl.Name+"_null"]; o != nil && fl.Nullable {
+				return errf(o.Line, "%s %s: field %s collides with the null flag of %s", b.Kind, b.Name, o.Name, fl.Name)
+			}
+		}
 	}
 	return nil
+
 }
 
 func typeList() string {

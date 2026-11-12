@@ -1,13 +1,17 @@
 // Package gen turns a parsed .kvp declaration into code: Go structs with
-// Pack/Unpack over the kvpack package, a C header and source over kvpack.h,
-// and Harbour functions over the hbkvpack wrapper. Every generator applies
-// the same rules: a required field missing (or of another type) fails the
-// decode, an optional field reads as zero when absent and is not written
-// when zero, a list is every item under its key, unknown keys are ignored
-// and a reply that carries key 0 is an error reply.
+// Pack/Unpack over the kvpack package, a C header and source over
+// kvp_arena.h, and Harbour classes over the hbkvpack wrapper. Every
+// generator applies the same rules: a required field missing (or of another
+// type) fails the decode, an optional field reads as zero when absent and
+// is not written when zero, a list is every item under its key, a nullable
+// field may arrive as a null and says so apart from its value -- and when
+// it is optional too it is not written when null and reads null when
+// absent -- a tupleset is a tuple definition with its tuples, unknown keys
+// are ignored and a reply that carries key 0 is an error reply.
 package gen
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/pablo-botella/kvpack/internal/schema"
@@ -35,13 +39,12 @@ func blockName(b *schema.Block) string {
 }
 
 // packOrder is the order every generator writes a block's fields in: the
-// single fields as declared, then the lists as declared. C can only add
-// lists after the rest, so Go and Harbour follow it and the three write
-// the same bytes.
+// single fields as declared, then the lists and tuplesets as declared, so
+// the three write the same bytes.
 func packOrder(b *schema.Block) []*schema.Field {
 	var single, lists []*schema.Field
 	for _, fl := range b.Fields {
-		if fl.List {
+		if fl.Late() {
 			lists = append(lists, fl)
 		} else {
 			single = append(single, fl)
@@ -50,24 +53,36 @@ func packOrder(b *schema.Block) []*schema.Field {
 	return append(single, lists...)
 }
 
-// hasSingle reports whether a block declares a field that is not a list.
-func hasSingle(b *schema.Block) bool {
-	for _, fl := range b.Fields {
-		if !fl.List {
-			return true
+// holdsItself refuses a record that reaches itself through fields that
+// always travel (anything but an optional field or a list): its empty value
+// would hold another one, and so on without end.
+func holdsItself(f *schema.File) error {
+	state := map[*schema.Block]int{} // 1 visiting, 2 done
+	var visit func(b *schema.Block) error
+	visit = func(b *schema.Block) error {
+		switch state[b] {
+		case 1:
+			return fmt.Errorf("%s:%d: record %s always holds itself: make the field optional or a list", f.Name, b.Line, b.Name)
+		case 2:
+			return nil
+		}
+		state[b] = 1
+		for _, fl := range b.Fields {
+			if fl.Type == schema.Rec && !fl.List && (!fl.Optional || fl.Nullable) {
+				if err := visit(fl.Record); err != nil {
+					return err
+				}
+			}
+		}
+		state[b] = 2
+		return nil
+	}
+	for _, b := range f.Blocks {
+		if err := visit(b); err != nil {
+			return err
 		}
 	}
-	return false
-}
-
-// hasLists reports whether a block declares a list field.
-func hasLists(b *schema.Block) bool {
-	for _, fl := range b.Fields {
-		if fl.List {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 // camel turns snake_case into CamelCase, with the usual initialisms.

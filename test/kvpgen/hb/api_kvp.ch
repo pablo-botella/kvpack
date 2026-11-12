@@ -6,6 +6,8 @@
 #define API_CMD_PING 2
 #define API_REC_EVENT 100
 #define API_REC_PERSON 101
+#define API_CMD_QUERY 3
+#define API_CMD_EVERY 4
 
 /* Keys of command login. */
 #define API_LOGIN_USER 1
@@ -34,5 +36,70 @@
 
 /* Keys of record person. */
 #define API_PERSON_NAME 1
+
+/* Keys of command query. */
+#define API_QUERY_SQL 1
+
+/* Keys of reply query. */
+#define API_QUERY_REPLY_CODE 1
+#define API_QUERY_REPLY_NOTE 2
+#define API_QUERY_REPLY_LIMIT 3
+#define API_QUERY_REPLY_AUTHOR 4
+#define API_QUERY_REPLY_ROWS 5
+#define API_QUERY_REPLY_EXTRA 6
+
+/* Keys of command every. */
+#define API_EVERY_R_INT32 1
+#define API_EVERY_R_INT64 2
+#define API_EVERY_R_TS 3
+#define API_EVERY_R_TEXT 4
+#define API_EVERY_R_BIN 5
+#define API_EVERY_R_BOOL 6
+#define API_EVERY_R_FLOAT64 7
+#define API_EVERY_R_DS 8
+#define API_EVERY_R_MSG 9
+#define API_EVERY_R_REC 10
+#define API_EVERY_O_INT32 11
+#define API_EVERY_O_INT64 12
+#define API_EVERY_O_TS 13
+#define API_EVERY_O_TEXT 14
+#define API_EVERY_O_BIN 15
+#define API_EVERY_O_BOOL 16
+#define API_EVERY_O_FLOAT64 17
+#define API_EVERY_O_DS 18
+#define API_EVERY_O_MSG 19
+#define API_EVERY_O_REC 20
+#define API_EVERY_N_INT32 21
+#define API_EVERY_N_INT64 22
+#define API_EVERY_N_TS 23
+#define API_EVERY_N_TEXT 24
+#define API_EVERY_N_BIN 25
+#define API_EVERY_N_BOOL 26
+#define API_EVERY_N_FLOAT64 27
+#define API_EVERY_N_DS 28
+#define API_EVERY_N_MSG 29
+#define API_EVERY_N_REC 30
+#define API_EVERY_ON_INT32 31
+#define API_EVERY_ON_INT64 32
+#define API_EVERY_ON_TS 33
+#define API_EVERY_ON_TEXT 34
+#define API_EVERY_ON_BIN 35
+#define API_EVERY_ON_BOOL 36
+#define API_EVERY_ON_FLOAT64 37
+#define API_EVERY_ON_DS 38
+#define API_EVERY_ON_MSG 39
+#define API_EVERY_ON_REC 40
+#define API_EVERY_L_INT32 41
+#define API_EVERY_L_INT64 42
+#define API_EVERY_L_TS 43
+#define API_EVERY_L_TEXT 44
+#define API_EVERY_L_BIN 45
+#define API_EVERY_L_BOOL 46
+#define API_EVERY_L_FLOAT64 47
+#define API_EVERY_L_DS 48
+#define API_EVERY_L_MSG 49
+#define API_EVERY_L_REC 50
+#define API_EVERY_R_SET 51
+#define API_EVERY_O_SET 52
 
 #endif

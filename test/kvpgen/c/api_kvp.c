@@ -3,124 +3,152 @@
 
 #include <string.h>
 
-int api_person_write(kvp_writer *w, const api_person *s)
+void api_person_put(kvp_out *o, const kvp_buffer *a, const api_person *s)
 {
-    kvp_add_utf8(w, API_PERSON_NAME, &s->name);
-    return w->error;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_bytes(o, a, API_PERSON_NAME, KVP_TEXT, 0, &s->name);
 }
 
-int api_person_encode(const api_person *s, void *buf, size_t cap, size_t *len)
+size_t api_person_size(const api_person *s, const kvp_buffer *a)
 {
-    kvp_writer w;
-    kvp_begin(&w, buf, cap, API_REC_PERSON);
-    api_person_write(&w, s);
-    return kvp_end(&w, len);
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_person_put(&o, a, s);
+    return o.size;
 }
 
-int api_person_read(const kvp_message *m, api_person *s)
+int api_person_encode(const api_person *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
 {
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_REC_PERSON);
+    api_person_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_person_read(const kvp_buffer *b, const kvp_message *m, api_person *s)
+{
+    int rc;
     memset(s, 0, sizeof *s);
-    s->kvp = *m;
-    if (kvp_get_utf8(m, API_PERSON_NAME, &s->name) != KVP_OK)
-        return KVP_E_MISSING;
+    kvp_span_of(b, m, &s->kvp);
+    rc = kvp_read_bytes(b, m, API_PERSON_NAME, KVP_TEXT, 0, &s->name);
+    if (rc != KVP_OK)
+        return rc;
     return KVP_OK;
 }
 
-int api_person_decode(const void *buf, size_t len, api_person *s)
+int api_person_decode(const kvp_buffer *b, api_person *s)
 {
     kvp_message m;
-    int rc = kvp_parse(buf, len, &m);
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
     if (rc != KVP_OK) {
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_person_read(&m, s);
+    return api_person_read(b, &m, s);
 }
 
-int api_event_write(kvp_writer *w, const api_event *s)
+void api_event_put(kvp_out *o, const kvp_buffer *a, const api_event *s)
 {
-    kvp_writer sub;
-    kvp_add_int32(w, API_EVENT_ID, s->id);
-    kvp_add_utf8(w, API_EVENT_TITLE, &s->title);
-    if (s->big != 0) {
-        kvp_add_int64(w, API_EVENT_BIG, s->big);
+    kvp_out sub;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_int32(o, API_EVENT_ID, 0, &s->id);
+    kvp_put_bytes(o, a, API_EVENT_TITLE, KVP_TEXT, 0, &s->title);
+    kvp_put_int64(o, API_EVENT_BIG, KVP_OPTIONAL, &s->big);
+    kvp_put_bytes(o, a, API_EVENT_BLOB, KVP_BIN, KVP_OPTIONAL, &s->blob);
+    kvp_put_bytes(o, a, API_EVENT_RAW, KVP_MSG, KVP_OPTIONAL, &s->raw);
+    if (kvp_put_begin(o, API_EVENT_WHO, 0, s->who.null, s->who.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->who.value);
+        kvp_put_end(o, &sub);
     }
-    if (s->blob.len != 0) {
-        kvp_add_bin(w, API_EVENT_BLOB, s->blob.p, s->blob.len);
-    }
-    if (s->raw.buf != NULL) {
-        kvp_add_msg(w, API_EVENT_RAW, s->raw.buf, s->raw.len);
-    }
-    kvp_begin_msg(w, API_EVENT_WHO, &sub, API_REC_PERSON);
-    api_person_write(&sub, &s->who);
-    kvp_end_msg(w, &sub);
-    if (s->active != 0) {
-        kvp_add_bool(w, API_EVENT_ACTIVE, s->active);
-    }
-    if (s->score != 0) {
-        kvp_add_float64(w, API_EVENT_SCORE, s->score);
-    }
-    if (s->day != 0) {
-        kvp_add_ds(w, API_EVENT_DAY, s->day);
-    }
-    return w->error;
+    kvp_put_bool(o, API_EVENT_ACTIVE, KVP_OPTIONAL, &s->active);
+    kvp_put_float64(o, API_EVENT_SCORE, KVP_OPTIONAL, &s->score);
+    kvp_put_ds(o, API_EVENT_DAY, KVP_OPTIONAL, &s->day);
+    kvp_put_list(o, a, API_EVENT_CODES, KVP_INT32, &s->kvp, &s->codes);
 }
 
-int api_event_encode(const api_event *s, void *buf, size_t cap, size_t *len)
+size_t api_event_size(const api_event *s, const kvp_buffer *a)
 {
-    kvp_writer w;
-    kvp_begin(&w, buf, cap, API_REC_EVENT);
-    api_event_write(&w, s);
-    return kvp_end(&w, len);
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_event_put(&o, a, s);
+    return o.size;
 }
 
-int api_event_read(const kvp_message *m, api_event *s)
+int api_event_encode(const api_event *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_REC_EVENT);
+    api_event_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_event_read(const kvp_buffer *b, const kvp_message *m, api_event *s)
 {
     kvp_message sub;
     int rc;
     memset(s, 0, sizeof *s);
-    s->kvp = *m;
-    if (kvp_get_int32(m, API_EVENT_ID, &s->id) != KVP_OK)
-        return KVP_E_MISSING;
-    if (kvp_get_utf8(m, API_EVENT_TITLE, &s->title) != KVP_OK)
-        return KVP_E_MISSING;
-    (void)kvp_get_int64(m, API_EVENT_BIG, &s->big);
-    (void)kvp_get_bin(m, API_EVENT_BLOB, &s->blob.p, &s->blob.len);
-    (void)kvp_get_msg(m, API_EVENT_RAW, &s->raw);
-    if (kvp_get_msg(m, API_EVENT_WHO, &sub) == KVP_OK) {
-        rc = api_person_read(&sub, &s->who);
-        if (rc != KVP_OK)
-            return rc;
-    } else {
-        return KVP_E_MISSING;
-    }
-    (void)kvp_get_bool(m, API_EVENT_ACTIVE, &s->active);
-    (void)kvp_get_float64(m, API_EVENT_SCORE, &s->score);
-    (void)kvp_get_ds(m, API_EVENT_DAY, &s->day);
+    kvp_span_of(b, m, &s->kvp);
+    rc = kvp_read_int32(m, API_EVENT_ID, 0, &s->id);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVENT_TITLE, KVP_TEXT, 0, &s->title);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int64(m, API_EVENT_BIG, KVP_OPTIONAL, &s->big);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVENT_BLOB, KVP_BIN, KVP_OPTIONAL, &s->blob);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVENT_RAW, KVP_MSG, KVP_OPTIONAL, &s->raw);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_read_list(m, API_EVENT_CODES, KVP_INT32, &s->codes);
+    rc = kvp_read_rec(m, API_EVENT_WHO, 0, &s->who.null, &s->who.has, &sub);
+    if (rc == KVP_OK && s->who.has)
+        rc = api_person_read(b, &sub, &s->who.value);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bool(m, API_EVENT_ACTIVE, KVP_OPTIONAL, &s->active);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_float64(m, API_EVENT_SCORE, KVP_OPTIONAL, &s->score);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ds(m, API_EVENT_DAY, KVP_OPTIONAL, &s->day);
+    if (rc != KVP_OK)
+        return rc;
     return KVP_OK;
 }
 
-int api_event_decode(const void *buf, size_t len, api_event *s)
+int api_event_decode(const kvp_buffer *b, api_event *s)
 {
     kvp_message m;
-    int rc = kvp_parse(buf, len, &m);
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
     if (rc != KVP_OK) {
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_event_read(&m, s);
+    return api_event_read(b, &m, s);
 }
 
-int api_event_add_codes(kvp_writer *w, int32_t v)
+int api_event_add_codes(kvp_buffer *a, api_event *s, int32_t v)
 {
-    return kvp_add_int32(w, API_EVENT_CODES, v);
+    return kvp_list_add_int32(a, &s->codes, v);
 }
 
-int api_event_codes(const api_event *s, kvp_item *it, int32_t *v)
+int api_event_codes(const kvp_buffer *b, const api_event *s, kvp_item *it, int32_t *v)
 {
-    int rc;
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
     for (;;) {
-        rc = it->value ? kvp_find_next(&s->kvp, it) : kvp_find(&s->kvp, API_EVENT_CODES, it);
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVENT_CODES, it);
         if (rc != KVP_OK)
             return rc;
         if (kvp_int32(it, v) == KVP_OK)
@@ -128,176 +156,813 @@ int api_event_codes(const api_event *s, kvp_item *it, int32_t *v)
     }
 }
 
-int api_login_write(kvp_writer *w, const api_login *s)
+void api_login_put(kvp_out *o, const kvp_buffer *a, const api_login *s)
 {
-    kvp_add_utf8(w, API_LOGIN_USER, &s->user);
-    kvp_add_utf8(w, API_LOGIN_PASSWORD, &s->password);
-    if (s->when != 0) {
-        kvp_add_ts(w, API_LOGIN_WHEN, s->when);
-    }
-    return w->error;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_bytes(o, a, API_LOGIN_USER, KVP_TEXT, 0, &s->user);
+    kvp_put_bytes(o, a, API_LOGIN_PASSWORD, KVP_TEXT, 0, &s->password);
+    kvp_put_ts(o, API_LOGIN_WHEN, KVP_OPTIONAL, &s->when);
+    kvp_put_list(o, a, API_LOGIN_TAGS, KVP_TEXT, &s->kvp, &s->tags);
 }
 
-int api_login_encode(const api_login *s, void *buf, size_t cap, size_t *len)
+size_t api_login_size(const api_login *s, const kvp_buffer *a)
 {
-    kvp_writer w;
-    kvp_begin(&w, buf, cap, API_CMD_LOGIN);
-    api_login_write(&w, s);
-    return kvp_end(&w, len);
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_login_put(&o, a, s);
+    return o.size;
 }
 
-int api_login_read(const kvp_message *m, api_login *s)
+int api_login_encode(const api_login *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
 {
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_LOGIN);
+    api_login_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_login_read(const kvp_buffer *b, const kvp_message *m, api_login *s)
+{
+    int rc;
     memset(s, 0, sizeof *s);
-    s->kvp = *m;
-    if (kvp_get_utf8(m, API_LOGIN_USER, &s->user) != KVP_OK)
-        return KVP_E_MISSING;
-    if (kvp_get_utf8(m, API_LOGIN_PASSWORD, &s->password) != KVP_OK)
-        return KVP_E_MISSING;
-    (void)kvp_get_ts(m, API_LOGIN_WHEN, &s->when);
+    kvp_span_of(b, m, &s->kvp);
+    rc = kvp_read_bytes(b, m, API_LOGIN_USER, KVP_TEXT, 0, &s->user);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_LOGIN_PASSWORD, KVP_TEXT, 0, &s->password);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_LOGIN_WHEN, KVP_OPTIONAL, &s->when);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_read_list(m, API_LOGIN_TAGS, KVP_TEXT, &s->tags);
     return KVP_OK;
 }
 
-int api_login_decode(const void *buf, size_t len, api_login *s)
+int api_login_decode(const kvp_buffer *b, api_login *s)
 {
     kvp_message m;
-    int rc = kvp_parse(buf, len, &m);
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
     if (rc != KVP_OK) {
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_login_read(&m, s);
+    return api_login_read(b, &m, s);
 }
 
-int api_login_add_tags(kvp_writer *w, const kvp_utf8 *v)
+int api_login_add_tags(kvp_buffer *a, api_login *s, const kvp_utf8 *v)
 {
-    return kvp_add_utf8(w, API_LOGIN_TAGS, v);
+    if (!v)
+        return KVP_E_ARGUMENT;
+    return kvp_list_add(a, &s->tags, KVP_TEXT, v->p, v->len);
 }
 
-int api_login_tags(const api_login *s, kvp_item *it, kvp_utf8 *v)
+int api_login_tags(const kvp_buffer *b, const api_login *s, kvp_item *it, kvp_text_st *v)
 {
-    int rc;
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
     for (;;) {
-        rc = it->value ? kvp_find_next(&s->kvp, it) : kvp_find(&s->kvp, API_LOGIN_TAGS, it);
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_LOGIN_TAGS, it);
         if (rc != KVP_OK)
             return rc;
-        if (kvp_item_utf8(it, v) == KVP_OK)
+        if (kvp_read_item(b, it, KVP_TEXT, v) == KVP_OK)
             return KVP_OK;
     }
 }
 
-int api_login_reply_write(kvp_writer *w, const api_login_reply *s)
+void api_login_reply_put(kvp_out *o, const kvp_buffer *a, const api_login_reply *s)
 {
-    kvp_writer sub;
-    kvp_add_utf8(w, API_LOGIN_REPLY_NAME, &s->name);
-    kvp_add_ts(w, API_LOGIN_REPLY_EXPIRES, s->expires);
-    if (s->level != 0) {
-        kvp_add_int32(w, API_LOGIN_REPLY_LEVEL, s->level);
+    kvp_out sub;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_bytes(o, a, API_LOGIN_REPLY_NAME, KVP_TEXT, 0, &s->name);
+    kvp_put_ts(o, API_LOGIN_REPLY_EXPIRES, 0, &s->expires);
+    kvp_put_int32(o, API_LOGIN_REPLY_LEVEL, KVP_OPTIONAL, &s->level);
+    if (kvp_put_begin(o, API_LOGIN_REPLY_OWNER, KVP_OPTIONAL, s->owner.null, s->owner.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->owner.value);
+        kvp_put_end(o, &sub);
     }
-    if (s->has_owner) {
-        kvp_begin_msg(w, API_LOGIN_REPLY_OWNER, &sub, API_REC_PERSON);
-        api_person_write(&sub, &s->owner);
-        kvp_end_msg(w, &sub);
-    }
-    return w->error;
+    kvp_put_list(o, a, API_LOGIN_REPLY_EVENTS, KVP_MSG, &s->kvp, &s->events);
 }
 
-int api_login_reply_encode(const api_login_reply *s, void *buf, size_t cap, size_t *len)
+size_t api_login_reply_size(const api_login_reply *s, const kvp_buffer *a)
 {
-    kvp_writer w;
-    kvp_begin(&w, buf, cap, API_CMD_LOGIN);
-    api_login_reply_write(&w, s);
-    return kvp_end(&w, len);
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_login_reply_put(&o, a, s);
+    return o.size;
 }
 
-int api_login_reply_read(const kvp_message *m, api_login_reply *s)
+int api_login_reply_encode(const api_login_reply *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_LOGIN);
+    api_login_reply_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_login_reply_read(const kvp_buffer *b, const kvp_message *m, api_login_reply *s)
 {
     kvp_message sub;
     int rc;
     memset(s, 0, sizeof *s);
-    s->kvp = *m;
+    kvp_span_of(b, m, &s->kvp);
     if (kvp_is_error(m))
         return KVP_E_REPLY;
-    if (kvp_get_utf8(m, API_LOGIN_REPLY_NAME, &s->name) != KVP_OK)
-        return KVP_E_MISSING;
-    if (kvp_get_ts(m, API_LOGIN_REPLY_EXPIRES, &s->expires) != KVP_OK)
-        return KVP_E_MISSING;
-    (void)kvp_get_int32(m, API_LOGIN_REPLY_LEVEL, &s->level);
-    if (kvp_get_msg(m, API_LOGIN_REPLY_OWNER, &sub) == KVP_OK) {
-        rc = api_person_read(&sub, &s->owner);
-        if (rc != KVP_OK)
-            return rc;
-        s->has_owner = 1;
-    }
+    rc = kvp_read_bytes(b, m, API_LOGIN_REPLY_NAME, KVP_TEXT, 0, &s->name);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_LOGIN_REPLY_EXPIRES, 0, &s->expires);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int32(m, API_LOGIN_REPLY_LEVEL, KVP_OPTIONAL, &s->level);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_read_list(m, API_LOGIN_REPLY_EVENTS, KVP_MSG, &s->events);
+    rc = kvp_read_rec(m, API_LOGIN_REPLY_OWNER, KVP_OPTIONAL, &s->owner.null, &s->owner.has, &sub);
+    if (rc == KVP_OK && s->owner.has)
+        rc = api_person_read(b, &sub, &s->owner.value);
+    if (rc != KVP_OK)
+        return rc;
     return KVP_OK;
 }
 
-int api_login_reply_decode(const void *buf, size_t len, api_login_reply *s)
+int api_login_reply_decode(const kvp_buffer *b, api_login_reply *s)
 {
     kvp_message m;
-    int rc = kvp_parse(buf, len, &m);
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
     if (rc != KVP_OK) {
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_login_reply_read(&m, s);
+    return api_login_reply_read(b, &m, s);
 }
 
-int api_login_reply_add_events(kvp_writer *w, const api_event *v)
+int api_login_reply_add_events(kvp_buffer *a, api_login_reply *s, const api_event *v)
 {
-    kvp_writer sub;
-    kvp_begin_msg(w, API_LOGIN_REPLY_EVENTS, &sub, API_REC_EVENT);
-    api_event_write(&sub, v);
-    return kvp_end_msg(w, &sub);
-}
-
-int api_login_reply_begin_events(kvp_writer *w, kvp_writer *sub, const api_event *v)
-{
-    kvp_begin_msg(w, API_LOGIN_REPLY_EVENTS, sub, API_REC_EVENT);
-    return api_event_write(sub, v);
-}
-
-int api_login_reply_events(const api_login_reply *s, kvp_item *it, api_event *v)
-{
-    kvp_message sub;
+    size_t n = api_event_size(v, a), len = 0;
+    kvp_off node;
     int rc;
+    if (n > 0xFFFFFFFFu)
+        return KVP_E_FULL;
+    rc = kvp_list_reserve(a, KVP_MSG, (uint32_t)n, &node);
+    if (rc != KVP_OK)
+        return rc;
+    rc = api_event_encode(v, a, kvp_list_value(a, node), n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    return kvp_list_link(a, &s->events, node);
+}
+
+int api_login_reply_events(const kvp_buffer *b, const api_login_reply *s, kvp_item *it, api_event *v)
+{
+    kvp_message m;
+    kvp_message sub;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
     for (;;) {
-        rc = it->value ? kvp_find_next(&s->kvp, it) : kvp_find(&s->kvp, API_LOGIN_REPLY_EVENTS, it);
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_LOGIN_REPLY_EVENTS, it);
         if (rc != KVP_OK)
             return rc;
         if (kvp_msg(it, &sub) == KVP_OK)
-            return api_event_read(&sub, v);
+            return api_event_read(b, &sub, v);
     }
 }
 
-int api_ping_write(kvp_writer *w, const api_ping *s)
+void api_ping_put(kvp_out *o, const kvp_buffer *a, const api_ping *s)
 {
+    (void)o;
+    (void)a;
     (void)s;
-    return w->error;
 }
 
-int api_ping_encode(const api_ping *s, void *buf, size_t cap, size_t *len)
+size_t api_ping_size(const api_ping *s, const kvp_buffer *a)
 {
-    kvp_writer w;
-    kvp_begin(&w, buf, cap, API_CMD_PING);
-    api_ping_write(&w, s);
-    return kvp_end(&w, len);
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_ping_put(&o, a, s);
+    return o.size;
 }
 
-int api_ping_read(const kvp_message *m, api_ping *s)
+int api_ping_encode(const api_ping *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_PING);
+    api_ping_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_ping_read(const kvp_buffer *b, const kvp_message *m, api_ping *s)
 {
     memset(s, 0, sizeof *s);
-    s->kvp = *m;
+    kvp_span_of(b, m, &s->kvp);
     return KVP_OK;
 }
 
-int api_ping_decode(const void *buf, size_t len, api_ping *s)
+int api_ping_decode(const kvp_buffer *b, api_ping *s)
 {
     kvp_message m;
-    int rc = kvp_parse(buf, len, &m);
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
     if (rc != KVP_OK) {
         memset(s, 0, sizeof *s);
         return rc;
     }
-    return api_ping_read(&m, s);
+    return api_ping_read(b, &m, s);
+}
+
+void api_query_put(kvp_out *o, const kvp_buffer *a, const api_query *s)
+{
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_bytes(o, a, API_QUERY_SQL, KVP_TEXT, 0, &s->sql);
+}
+
+size_t api_query_size(const api_query *s, const kvp_buffer *a)
+{
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_query_put(&o, a, s);
+    return o.size;
+}
+
+int api_query_encode(const api_query *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_QUERY);
+    api_query_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_query_read(const kvp_buffer *b, const kvp_message *m, api_query *s)
+{
+    int rc;
+    memset(s, 0, sizeof *s);
+    kvp_span_of(b, m, &s->kvp);
+    rc = kvp_read_bytes(b, m, API_QUERY_SQL, KVP_TEXT, 0, &s->sql);
+    if (rc != KVP_OK)
+        return rc;
+    return KVP_OK;
+}
+
+int api_query_decode(const kvp_buffer *b, api_query *s)
+{
+    kvp_message m;
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
+    if (rc != KVP_OK) {
+        memset(s, 0, sizeof *s);
+        return rc;
+    }
+    return api_query_read(b, &m, s);
+}
+
+void api_query_reply_put(kvp_out *o, const kvp_buffer *a, const api_query_reply *s)
+{
+    kvp_out sub;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_int32(o, API_QUERY_REPLY_CODE, 0, &s->code);
+    kvp_put_bytes(o, a, API_QUERY_REPLY_NOTE, KVP_TEXT, KVP_NULLABLE, &s->note);
+    kvp_put_int32(o, API_QUERY_REPLY_LIMIT, KVP_OPTIONAL | KVP_NULLABLE, &s->limit);
+    if (kvp_put_begin(o, API_QUERY_REPLY_AUTHOR, KVP_NULLABLE, s->author.null, s->author.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->author.value);
+        kvp_put_end(o, &sub);
+    }
+    kvp_put_tupleset(o, a, API_QUERY_REPLY_ROWS, 0, &s->kvp, &s->rows);
+    kvp_put_tupleset(o, a, API_QUERY_REPLY_EXTRA, KVP_OPTIONAL, &s->kvp, &s->extra);
+}
+
+size_t api_query_reply_size(const api_query_reply *s, const kvp_buffer *a)
+{
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_query_reply_put(&o, a, s);
+    return o.size;
+}
+
+int api_query_reply_encode(const api_query_reply *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_QUERY);
+    api_query_reply_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_query_reply_read(const kvp_buffer *b, const kvp_message *m, api_query_reply *s)
+{
+    kvp_message sub;
+    int rc;
+    memset(s, 0, sizeof *s);
+    kvp_span_of(b, m, &s->kvp);
+    if (kvp_is_error(m))
+        return KVP_E_REPLY;
+    rc = kvp_read_int32(m, API_QUERY_REPLY_CODE, 0, &s->code);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_QUERY_REPLY_NOTE, KVP_TEXT, KVP_NULLABLE, &s->note);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int32(m, API_QUERY_REPLY_LIMIT, KVP_OPTIONAL | KVP_NULLABLE, &s->limit);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_rec(m, API_QUERY_REPLY_AUTHOR, KVP_NULLABLE, &s->author.null, &s->author.has, &sub);
+    if (rc == KVP_OK && s->author.has)
+        rc = api_person_read(b, &sub, &s->author.value);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_tupleset(m, API_QUERY_REPLY_ROWS, 0, &s->rows);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_tupleset(m, API_QUERY_REPLY_EXTRA, KVP_OPTIONAL, &s->extra);
+    if (rc != KVP_OK)
+        return rc;
+    return KVP_OK;
+}
+
+int api_query_reply_decode(const kvp_buffer *b, api_query_reply *s)
+{
+    kvp_message m;
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
+    if (rc != KVP_OK) {
+        memset(s, 0, sizeof *s);
+        return rc;
+    }
+    return api_query_reply_read(b, &m, s);
+}
+
+void api_every_put(kvp_out *o, const kvp_buffer *a, const api_every *s)
+{
+    kvp_out sub;
+    (void)o;
+    (void)a;
+    (void)s;
+    kvp_put_int32(o, API_EVERY_R_INT32, 0, &s->r_int32);
+    kvp_put_int64(o, API_EVERY_R_INT64, 0, &s->r_int64);
+    kvp_put_ts(o, API_EVERY_R_TS, 0, &s->r_ts);
+    kvp_put_bytes(o, a, API_EVERY_R_TEXT, KVP_TEXT, 0, &s->r_text);
+    kvp_put_bytes(o, a, API_EVERY_R_BIN, KVP_BIN, 0, &s->r_bin);
+    kvp_put_bool(o, API_EVERY_R_BOOL, 0, &s->r_bool);
+    kvp_put_float64(o, API_EVERY_R_FLOAT64, 0, &s->r_float64);
+    kvp_put_ds(o, API_EVERY_R_DS, 0, &s->r_ds);
+    kvp_put_bytes(o, a, API_EVERY_R_MSG, KVP_MSG, 0, &s->r_msg);
+    if (kvp_put_begin(o, API_EVERY_R_REC, 0, s->r_rec.null, s->r_rec.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->r_rec.value);
+        kvp_put_end(o, &sub);
+    }
+    kvp_put_int32(o, API_EVERY_O_INT32, KVP_OPTIONAL, &s->o_int32);
+    kvp_put_int64(o, API_EVERY_O_INT64, KVP_OPTIONAL, &s->o_int64);
+    kvp_put_ts(o, API_EVERY_O_TS, KVP_OPTIONAL, &s->o_ts);
+    kvp_put_bytes(o, a, API_EVERY_O_TEXT, KVP_TEXT, KVP_OPTIONAL, &s->o_text);
+    kvp_put_bytes(o, a, API_EVERY_O_BIN, KVP_BIN, KVP_OPTIONAL, &s->o_bin);
+    kvp_put_bool(o, API_EVERY_O_BOOL, KVP_OPTIONAL, &s->o_bool);
+    kvp_put_float64(o, API_EVERY_O_FLOAT64, KVP_OPTIONAL, &s->o_float64);
+    kvp_put_ds(o, API_EVERY_O_DS, KVP_OPTIONAL, &s->o_ds);
+    kvp_put_bytes(o, a, API_EVERY_O_MSG, KVP_MSG, KVP_OPTIONAL, &s->o_msg);
+    if (kvp_put_begin(o, API_EVERY_O_REC, KVP_OPTIONAL, s->o_rec.null, s->o_rec.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->o_rec.value);
+        kvp_put_end(o, &sub);
+    }
+    kvp_put_int32(o, API_EVERY_N_INT32, KVP_NULLABLE, &s->n_int32);
+    kvp_put_int64(o, API_EVERY_N_INT64, KVP_NULLABLE, &s->n_int64);
+    kvp_put_ts(o, API_EVERY_N_TS, KVP_NULLABLE, &s->n_ts);
+    kvp_put_bytes(o, a, API_EVERY_N_TEXT, KVP_TEXT, KVP_NULLABLE, &s->n_text);
+    kvp_put_bytes(o, a, API_EVERY_N_BIN, KVP_BIN, KVP_NULLABLE, &s->n_bin);
+    kvp_put_bool(o, API_EVERY_N_BOOL, KVP_NULLABLE, &s->n_bool);
+    kvp_put_float64(o, API_EVERY_N_FLOAT64, KVP_NULLABLE, &s->n_float64);
+    kvp_put_ds(o, API_EVERY_N_DS, KVP_NULLABLE, &s->n_ds);
+    kvp_put_bytes(o, a, API_EVERY_N_MSG, KVP_MSG, KVP_NULLABLE, &s->n_msg);
+    if (kvp_put_begin(o, API_EVERY_N_REC, KVP_NULLABLE, s->n_rec.null, s->n_rec.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->n_rec.value);
+        kvp_put_end(o, &sub);
+    }
+    kvp_put_int32(o, API_EVERY_ON_INT32, KVP_OPTIONAL | KVP_NULLABLE, &s->on_int32);
+    kvp_put_int64(o, API_EVERY_ON_INT64, KVP_OPTIONAL | KVP_NULLABLE, &s->on_int64);
+    kvp_put_ts(o, API_EVERY_ON_TS, KVP_OPTIONAL | KVP_NULLABLE, &s->on_ts);
+    kvp_put_bytes(o, a, API_EVERY_ON_TEXT, KVP_TEXT, KVP_OPTIONAL | KVP_NULLABLE, &s->on_text);
+    kvp_put_bytes(o, a, API_EVERY_ON_BIN, KVP_BIN, KVP_OPTIONAL | KVP_NULLABLE, &s->on_bin);
+    kvp_put_bool(o, API_EVERY_ON_BOOL, KVP_OPTIONAL | KVP_NULLABLE, &s->on_bool);
+    kvp_put_float64(o, API_EVERY_ON_FLOAT64, KVP_OPTIONAL | KVP_NULLABLE, &s->on_float64);
+    kvp_put_ds(o, API_EVERY_ON_DS, KVP_OPTIONAL | KVP_NULLABLE, &s->on_ds);
+    kvp_put_bytes(o, a, API_EVERY_ON_MSG, KVP_MSG, KVP_OPTIONAL | KVP_NULLABLE, &s->on_msg);
+    if (kvp_put_begin(o, API_EVERY_ON_REC, KVP_OPTIONAL | KVP_NULLABLE, s->on_rec.null, s->on_rec.has, &sub, API_REC_PERSON)) {
+        api_person_put(&sub, a, &s->on_rec.value);
+        kvp_put_end(o, &sub);
+    }
+    kvp_put_list(o, a, API_EVERY_L_INT32, KVP_INT32, &s->kvp, &s->l_int32);
+    kvp_put_list(o, a, API_EVERY_L_INT64, KVP_INT64, &s->kvp, &s->l_int64);
+    kvp_put_list(o, a, API_EVERY_L_TS, KVP_TS, &s->kvp, &s->l_ts);
+    kvp_put_list(o, a, API_EVERY_L_TEXT, KVP_TEXT, &s->kvp, &s->l_text);
+    kvp_put_list(o, a, API_EVERY_L_BIN, KVP_BIN, &s->kvp, &s->l_bin);
+    kvp_put_list(o, a, API_EVERY_L_BOOL, KVP_BOOL, &s->kvp, &s->l_bool);
+    kvp_put_list(o, a, API_EVERY_L_FLOAT64, KVP_FLOAT64, &s->kvp, &s->l_float64);
+    kvp_put_list(o, a, API_EVERY_L_DS, KVP_DS, &s->kvp, &s->l_ds);
+    kvp_put_list(o, a, API_EVERY_L_MSG, KVP_MSG, &s->kvp, &s->l_msg);
+    kvp_put_list(o, a, API_EVERY_L_REC, KVP_MSG, &s->kvp, &s->l_rec);
+    kvp_put_tupleset(o, a, API_EVERY_R_SET, 0, &s->kvp, &s->r_set);
+    kvp_put_tupleset(o, a, API_EVERY_O_SET, KVP_OPTIONAL, &s->kvp, &s->o_set);
+}
+
+size_t api_every_size(const api_every *s, const kvp_buffer *a)
+{
+    kvp_out o;
+    kvp_out_measure(&o);
+    api_every_put(&o, a, s);
+    return o.size;
+}
+
+int api_every_encode(const api_every *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)
+{
+    kvp_out o;
+    kvp_out_begin(&o, buf, cap, API_CMD_EVERY);
+    api_every_put(&o, a, s);
+    return kvp_out_end(&o, len);
+}
+
+int api_every_read(const kvp_buffer *b, const kvp_message *m, api_every *s)
+{
+    kvp_message sub;
+    int rc;
+    memset(s, 0, sizeof *s);
+    kvp_span_of(b, m, &s->kvp);
+    rc = kvp_read_int32(m, API_EVERY_R_INT32, 0, &s->r_int32);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int64(m, API_EVERY_R_INT64, 0, &s->r_int64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_EVERY_R_TS, 0, &s->r_ts);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_R_TEXT, KVP_TEXT, 0, &s->r_text);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_R_BIN, KVP_BIN, 0, &s->r_bin);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bool(m, API_EVERY_R_BOOL, 0, &s->r_bool);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_float64(m, API_EVERY_R_FLOAT64, 0, &s->r_float64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ds(m, API_EVERY_R_DS, 0, &s->r_ds);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_R_MSG, KVP_MSG, 0, &s->r_msg);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_rec(m, API_EVERY_R_REC, 0, &s->r_rec.null, &s->r_rec.has, &sub);
+    if (rc == KVP_OK && s->r_rec.has)
+        rc = api_person_read(b, &sub, &s->r_rec.value);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int32(m, API_EVERY_O_INT32, KVP_OPTIONAL, &s->o_int32);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int64(m, API_EVERY_O_INT64, KVP_OPTIONAL, &s->o_int64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_EVERY_O_TS, KVP_OPTIONAL, &s->o_ts);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_O_TEXT, KVP_TEXT, KVP_OPTIONAL, &s->o_text);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_O_BIN, KVP_BIN, KVP_OPTIONAL, &s->o_bin);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bool(m, API_EVERY_O_BOOL, KVP_OPTIONAL, &s->o_bool);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_float64(m, API_EVERY_O_FLOAT64, KVP_OPTIONAL, &s->o_float64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ds(m, API_EVERY_O_DS, KVP_OPTIONAL, &s->o_ds);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_O_MSG, KVP_MSG, KVP_OPTIONAL, &s->o_msg);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_rec(m, API_EVERY_O_REC, KVP_OPTIONAL, &s->o_rec.null, &s->o_rec.has, &sub);
+    if (rc == KVP_OK && s->o_rec.has)
+        rc = api_person_read(b, &sub, &s->o_rec.value);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int32(m, API_EVERY_N_INT32, KVP_NULLABLE, &s->n_int32);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int64(m, API_EVERY_N_INT64, KVP_NULLABLE, &s->n_int64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_EVERY_N_TS, KVP_NULLABLE, &s->n_ts);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_N_TEXT, KVP_TEXT, KVP_NULLABLE, &s->n_text);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_N_BIN, KVP_BIN, KVP_NULLABLE, &s->n_bin);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bool(m, API_EVERY_N_BOOL, KVP_NULLABLE, &s->n_bool);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_float64(m, API_EVERY_N_FLOAT64, KVP_NULLABLE, &s->n_float64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ds(m, API_EVERY_N_DS, KVP_NULLABLE, &s->n_ds);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_N_MSG, KVP_MSG, KVP_NULLABLE, &s->n_msg);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_rec(m, API_EVERY_N_REC, KVP_NULLABLE, &s->n_rec.null, &s->n_rec.has, &sub);
+    if (rc == KVP_OK && s->n_rec.has)
+        rc = api_person_read(b, &sub, &s->n_rec.value);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int32(m, API_EVERY_ON_INT32, KVP_OPTIONAL | KVP_NULLABLE, &s->on_int32);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_int64(m, API_EVERY_ON_INT64, KVP_OPTIONAL | KVP_NULLABLE, &s->on_int64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ts(m, API_EVERY_ON_TS, KVP_OPTIONAL | KVP_NULLABLE, &s->on_ts);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_ON_TEXT, KVP_TEXT, KVP_OPTIONAL | KVP_NULLABLE, &s->on_text);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_ON_BIN, KVP_BIN, KVP_OPTIONAL | KVP_NULLABLE, &s->on_bin);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bool(m, API_EVERY_ON_BOOL, KVP_OPTIONAL | KVP_NULLABLE, &s->on_bool);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_float64(m, API_EVERY_ON_FLOAT64, KVP_OPTIONAL | KVP_NULLABLE, &s->on_float64);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_ds(m, API_EVERY_ON_DS, KVP_OPTIONAL | KVP_NULLABLE, &s->on_ds);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_bytes(b, m, API_EVERY_ON_MSG, KVP_MSG, KVP_OPTIONAL | KVP_NULLABLE, &s->on_msg);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_rec(m, API_EVERY_ON_REC, KVP_OPTIONAL | KVP_NULLABLE, &s->on_rec.null, &s->on_rec.has, &sub);
+    if (rc == KVP_OK && s->on_rec.has)
+        rc = api_person_read(b, &sub, &s->on_rec.value);
+    if (rc != KVP_OK)
+        return rc;
+    kvp_read_list(m, API_EVERY_L_INT32, KVP_INT32, &s->l_int32);
+    kvp_read_list(m, API_EVERY_L_INT64, KVP_INT64, &s->l_int64);
+    kvp_read_list(m, API_EVERY_L_TS, KVP_TS, &s->l_ts);
+    kvp_read_list(m, API_EVERY_L_TEXT, KVP_TEXT, &s->l_text);
+    kvp_read_list(m, API_EVERY_L_BIN, KVP_BIN, &s->l_bin);
+    kvp_read_list(m, API_EVERY_L_BOOL, KVP_BOOL, &s->l_bool);
+    kvp_read_list(m, API_EVERY_L_FLOAT64, KVP_FLOAT64, &s->l_float64);
+    kvp_read_list(m, API_EVERY_L_DS, KVP_DS, &s->l_ds);
+    kvp_read_list(m, API_EVERY_L_MSG, KVP_MSG, &s->l_msg);
+    kvp_read_list(m, API_EVERY_L_REC, KVP_MSG, &s->l_rec);
+    rc = kvp_read_tupleset(m, API_EVERY_R_SET, 0, &s->r_set);
+    if (rc != KVP_OK)
+        return rc;
+    rc = kvp_read_tupleset(m, API_EVERY_O_SET, KVP_OPTIONAL, &s->o_set);
+    if (rc != KVP_OK)
+        return rc;
+    return KVP_OK;
+}
+
+int api_every_decode(const kvp_buffer *b, api_every *s)
+{
+    kvp_message m;
+    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;
+    if (rc != KVP_OK) {
+        memset(s, 0, sizeof *s);
+        return rc;
+    }
+    return api_every_read(b, &m, s);
+}
+
+int api_every_add_l_int32(kvp_buffer *a, api_every *s, int32_t v)
+{
+    return kvp_list_add_int32(a, &s->l_int32, v);
+}
+
+int api_every_l_int32(const kvp_buffer *b, const api_every *s, kvp_item *it, int32_t *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_INT32, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_int32(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_int64(kvp_buffer *a, api_every *s, int64_t v)
+{
+    return kvp_list_add_int64(a, &s->l_int64, v);
+}
+
+int api_every_l_int64(const kvp_buffer *b, const api_every *s, kvp_item *it, int64_t *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_INT64, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_int64(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_ts(kvp_buffer *a, api_every *s, int64_t v)
+{
+    return kvp_list_add_ts(a, &s->l_ts, v);
+}
+
+int api_every_l_ts(const kvp_buffer *b, const api_every *s, kvp_item *it, int64_t *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_TS, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_ts(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_text(kvp_buffer *a, api_every *s, const kvp_utf8 *v)
+{
+    if (!v)
+        return KVP_E_ARGUMENT;
+    return kvp_list_add(a, &s->l_text, KVP_TEXT, v->p, v->len);
+}
+
+int api_every_l_text(const kvp_buffer *b, const api_every *s, kvp_item *it, kvp_text_st *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_TEXT, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_read_item(b, it, KVP_TEXT, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_bin(kvp_buffer *a, api_every *s, const kvp_bytes *v)
+{
+    if (!v)
+        return KVP_E_ARGUMENT;
+    return kvp_list_add(a, &s->l_bin, KVP_BIN, v->p, v->len);
+}
+
+int api_every_l_bin(const kvp_buffer *b, const api_every *s, kvp_item *it, kvp_bin_st *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_BIN, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_read_item(b, it, KVP_BIN, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_bool(kvp_buffer *a, api_every *s, int v)
+{
+    return kvp_list_add_bool(a, &s->l_bool, v);
+}
+
+int api_every_l_bool(const kvp_buffer *b, const api_every *s, kvp_item *it, int *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_BOOL, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_bool(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_float64(kvp_buffer *a, api_every *s, double v)
+{
+    return kvp_list_add_float64(a, &s->l_float64, v);
+}
+
+int api_every_l_float64(const kvp_buffer *b, const api_every *s, kvp_item *it, double *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_FLOAT64, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_float64(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_ds(kvp_buffer *a, api_every *s, int32_t v)
+{
+    return kvp_list_add_ds(a, &s->l_ds, v);
+}
+
+int api_every_l_ds(const kvp_buffer *b, const api_every *s, kvp_item *it, int32_t *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_DS, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_ds(it, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_msg(kvp_buffer *a, api_every *s, const kvp_message *v)
+{
+    if (!v || v->len > 0xFFFFFFFFu)
+        return KVP_E_ARGUMENT;
+    return kvp_list_add(a, &s->l_msg, KVP_MSG, v->buf, (uint32_t)v->len);
+}
+
+int api_every_l_msg(const kvp_buffer *b, const api_every *s, kvp_item *it, kvp_msg_st *v)
+{
+    kvp_message m;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_MSG, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_read_item(b, it, KVP_MSG, v) == KVP_OK)
+            return KVP_OK;
+    }
+}
+
+int api_every_add_l_rec(kvp_buffer *a, api_every *s, const api_person *v)
+{
+    size_t n = api_person_size(v, a), len = 0;
+    kvp_off node;
+    int rc;
+    if (n > 0xFFFFFFFFu)
+        return KVP_E_FULL;
+    rc = kvp_list_reserve(a, KVP_MSG, (uint32_t)n, &node);
+    if (rc != KVP_OK)
+        return rc;
+    rc = api_person_encode(v, a, kvp_list_value(a, node), n, &len);
+    if (rc != KVP_OK)
+        return rc;
+    return kvp_list_link(a, &s->l_rec, node);
+}
+
+int api_every_l_rec(const kvp_buffer *b, const api_every *s, kvp_item *it, api_person *v)
+{
+    kvp_message m;
+    kvp_message sub;
+    int rc = kvp_span_message(b, &s->kvp, &m);
+    if (rc != KVP_OK)
+        return rc;
+    for (;;) {
+        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, API_EVERY_L_REC, it);
+        if (rc != KVP_OK)
+            return rc;
+        if (kvp_msg(it, &sub) == KVP_OK)
+            return api_person_read(b, &sub, v);
+    }
 }

@@ -17,6 +17,14 @@
 #define KVP_BOOL         7
 #define KVP_FLOAT64      8
 #define KVP_DS           9
+#define KVP_NULL         10
+#define KVP_TUPLEDEF     11
+#define KVP_TUPLE        12
+
+/* Positions in a field of a tuple definition (KvpAddTupleDef, KvpTupleDef). */
+#define KVP_FIELD_NAME   1
+#define KVP_FIELD_TYPE   2
+#define KVP_FIELD_META   3
 
 /* Positions in the array returned by KvpItem. */
 #define KVP_ITEM_KEY     1

@@ -9,3 +9,4 @@ test_api.prg
 api_kvp.prg
 ../../../capi/kvpack.c
 ../../../capi/hbkvpack.c
+../../../capi/kvpclass.prg

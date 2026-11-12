@@ -38,7 +38,8 @@ mkskill:
   takes a NUL-terminated UTF-8 string; the C reader copies with a terminator
   and reports `KVP_E_FULL` when truncated. Harbour passes bytes through:
   convert with `hb_UTF8ToStr`/`hb_StrToUTF8` as needed.
-- **The C side allocates nothing.** `kvp_begin` needs a buffer sized with
+- **`kvpack.c` allocates nothing** (the arena of the generated C structs
+  does, through the application's `malloc`). `kvp_begin` needs a buffer sized with
   `kvp_room(nitems, value_bytes)`; a parsed `kvp_message` points into the
   caller's bytes, which must stay valid. The Harbour wrapper copies and the
   garbage collector frees.

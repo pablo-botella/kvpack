@@ -8,18 +8,22 @@ import (
 	"github.com/pablo-botella/kvpack/internal/schema"
 )
 
-// cTypes maps a base type to the C type of its struct member, the reader
-// by key (kvp_get_*) and the reader of a walked item.
-var cTypes = map[string]struct{ typ, get, item string }{
-	schema.Int32:   {"int32_t", "kvp_get_int32", "kvp_int32"},
-	schema.Int64:   {"int64_t", "kvp_get_int64", "kvp_int64"},
-	schema.TS:      {"int64_t", "kvp_get_ts", "kvp_ts"},
-	schema.Text:    {"kvp_utf8", "kvp_get_utf8", "kvp_item_utf8"},
-	schema.Bin:     {"kvp_bytes", "kvp_get_bin", "kvp_bin"},
-	schema.Msg:     {"kvp_message", "kvp_get_msg", "kvp_msg"},
-	schema.Bool:    {"int", "kvp_get_bool", "kvp_bool"},
-	schema.Float64: {"double", "kvp_get_float64", "kvp_float64"},
-	schema.DS:      {"int32_t", "kvp_get_ds", "kvp_ds"},
+// cTypes maps a base type to the record its struct member is (kvp_arena.h),
+// its KVP_* constant, the suffix of the kvp_put_/kvp_read_/kvp_list_add_
+// functions of a scalar ("" for what travels as bytes), and the plain C
+// type and item reader of a scalar list element.
+var cTypes = map[string]struct{ st, kvp, fn, plain, item string }{
+	schema.Int32:    {"kvp_int32_st", "KVP_INT32", "int32", "int32_t", "kvp_int32"},
+	schema.Int64:    {"kvp_int64_st", "KVP_INT64", "int64", "int64_t", "kvp_int64"},
+	schema.TS:       {"kvp_ts_st", "KVP_TS", "ts", "int64_t", "kvp_ts"},
+	schema.Text:     {"kvp_text_st", "KVP_TEXT", "", "", ""},
+	schema.Bin:      {"kvp_bin_st", "KVP_BIN", "", "", ""},
+	schema.Msg:      {"kvp_msg_st", "KVP_MSG", "", "", ""},
+	schema.Bool:     {"kvp_bool_st", "KVP_BOOL", "bool", "int", "kvp_bool"},
+	schema.Float64:  {"kvp_float64_st", "KVP_FLOAT64", "float64", "double", "kvp_float64"},
+	schema.DS:       {"kvp_ds_st", "KVP_DS", "ds", "int32_t", "kvp_ds"},
+	schema.TupleSet: {"kvp_tupleset_st", "KVP_TUPLEDEF", "", "", ""},
+	schema.Rec:      {"", "KVP_MSG", "", "", ""},
 }
 
 var cKeywords = map[string]bool{
@@ -33,14 +37,16 @@ var cKeywords = map[string]bool{
 
 var prefixRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
-// C generates a header and a source over kvpack.h. prefix starts every
+// C generates a header and a source over kvp_arena.h. prefix starts every
 // name ("api": API_CMD_LOGIN, api_login, api_login_decode); hname is the
 // header's file name, included by the source.
 //
-// Per block it writes a struct (text and bin by reference into the
-// message, a kvp_message member the lists are walked through) and
-// _write/_encode (struct to message), _read/_decode (message to struct),
-// and per list field _add_<field> (write one element) and _<field> (walk).
+// Per block it writes a struct of fixed size whose members are records: a
+// value and whether it is null, or where the bytes of a text, a list or a
+// tupleset lie in a buffer. With it go _put (the fields, in order, into a
+// kvp_out), _size and _encode (struct to message), _read and _decode
+// (message to struct), and per list field _add_<field> (one more element)
+// and _<field> (the walk of a decoded one).
 func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 	if !prefixRe.MatchString(prefix) {
 		return nil, nil, fmt.Errorf("C prefix %q: use lowercase letters, digits and _", prefix)
@@ -61,7 +67,7 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 
 	hw("/* %s */\n", header(f))
 	hw("%s", cUsage)
-	hw("#ifndef %s\n#define %s\n\n#include \"kvpack.h\"\n\n", guard, guard)
+	hw("#ifndef %s\n#define %s\n\n#include \"kvp_arena.h\"\n\n", guard, guard)
 	hw("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 	hw("/* Command and record numbers. */\n")
 	for _, bl := range f.Blocks {
@@ -84,6 +90,11 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 
 	cw("/* %s */\n#include \"%s\"\n\n#include <string.h>\n", header(f), baseName(hname))
 
+	// every struct first, so a block may hold a list of a record declared
+	// after it; then the functions
+	for _, bl := range order {
+		cStruct(hw, prefix, bl)
+	}
 	for _, bl := range order {
 		cBlock(hw, cw, prefix, P, bl)
 	}
@@ -93,22 +104,49 @@ func C(f *schema.File, prefix, hname string) (h, c []byte, err error) {
 
 const cUsage = `
 /*
- * Per block X: a struct X, and
- *   X_encode(&s, buf, cap, &len)   the whole message (lists left empty)
- *   X_write(&w, &s)                the single fields, between kvp_begin and
- *                                  kvp_end, so lists can be added after
- *   X_decode(buf, len, &s)         KVP_E_MISSING when a required field is
- *                                  absent; KVP_E_REPLY for an error reply
- *                                  (read it with kvp_error_text)
- *   X_read(&m, &s)                 the same over a parsed message
+ * Per block X: a struct X of fixed size, the caller's to declare and to set
+ * to zero. Its members are records (kvp_arena.h): a scalar is { null, value }
+ * and is assigned directly; a text, bin or msg is { null, size, off }, its
+ * bytes in an arena -- set it with kvp_set_text or kvp_set_bytes, read it
+ * with kvp_st_ptr; a record is { null, has, value }; a list and a tupleset
+ * are filled through functions. The arena is a kvp_buffer (dyn_buffer.h)
+ * over the application's malloc and free: it holds everything of variable
+ * size, and one kvp_buffer_free releases it all.
+ *
+ *   X_size(&s, &a)                    the exact size of the message
+ *   X_encode(&s, &a, buf, cap, &len)  the message, into the caller's buffer
+ *   X_decode(&b, &s)                  the struct from the message b holds
+ *                                     (kvp_buffer_wrap over the bytes
+ *                                     received): KVP_E_MISSING when a
+ *                                     required field is absent, KVP_E_REPLY
+ *                                     for an error reply (read it with
+ *                                     kvp_error_text). Nothing is copied:
+ *                                     the struct refers to the bytes of b
+ *   X_put(&o, &a, &s), X_read(&b, &m, &s)   the same over a kvp_out and a
+ *                                     parsed message that lies in b
  * and per list field F:
- *   X_add_F(&w, v)                 one element, after X_write
- *   X_begin_F(&w, &sub, &v)        a record element left open in sub, to
- *                                  add its own lists; close with
- *                                  kvp_end_msg(&w, &sub)
- *   X_F(&s, &it, &v)               the walk: zero it first, then call
- *                                  until it returns KVP_E_NOT_FOUND
- * Text and bin point into the decoded bytes, which must outlive the struct.
+ *   X_add_F(&a, &s, v)                one more element, copied into the arena
+ *   X_F(&b, &s, &it, &v)              the walk of a decoded struct: zero it
+ *                                     first, then call until it returns
+ *                                     KVP_E_NOT_FOUND
+ * A list of records takes each element as a struct of its own, filled (its
+ * lists too) before it is added.
+ *
+ * What is written follows the declaration: a field always; an optional one
+ * when it is not empty (0, no bytes, has 0, a tupleset of no fields); a
+ * nullable one always, as a null when its null is set; an optional nullable
+ * one when it is not null. Reading mirrors it: an optional field that did
+ * not arrive reads empty, an optional nullable one reads null. So a struct
+ * at zero writes every field that is not optional, as its empty value: a
+ * zero, no bytes, a message of command 0 and no items, a record of empty
+ * fields, a tuple definition of no fields.
+ *
+ * A tupleset field is built with kvp_tupleset_field, kvp_tupleset_begin,
+ * kvp_tupleset_int32... and kvp_tupleset_end on the member, and read with
+ * kvp_tupleset_open over the struct's kvp member.
+ *
+ * A decoded struct can be encoded again, with the buffer it was decoded
+ * from: its lists and tuplesets are written as they arrived.
  */
 
 `
@@ -122,6 +160,20 @@ func cNum(P string, bl *schema.Block) string {
 		return P + "_REC_" + strings.ToUpper(bl.Name)
 	}
 	return P + "_CMD_" + strings.ToUpper(bl.Name)
+}
+
+// cFlags is the flags argument a field's declaration gives the kvp_put_
+// and kvp_read_ functions.
+func cFlags(fl *schema.Field) string {
+	switch {
+	case fl.Optional && fl.Nullable:
+		return "KVP_OPTIONAL | KVP_NULLABLE"
+	case fl.Optional:
+		return "KVP_OPTIONAL"
+	case fl.Nullable:
+		return "KVP_NULLABLE"
+	}
+	return "0"
 }
 
 // cOrder puts records before the blocks that embed them (a single record
@@ -185,44 +237,27 @@ func cCheck(f *schema.File, prefix string) error {
 		if err := add(prefix+"_"+blockName(bl), bl.Kind.String()+" "+bl.Name); err != nil {
 			return err
 		}
-		members := map[string]bool{}
-		for _, fl := range bl.Fields {
-			if cKeywords[fl.Name] {
-				return fmt.Errorf("%s:%d: field name %q is a C keyword", f.Name, fl.Line, fl.Name)
-			}
-			members[fl.Name] = true
-			if err := add(cKey(P, bl, fl), "field "+bl.Name+"."+fl.Name); err != nil {
+		if bl.Kind == schema.Record { // the record of a field of that type
+			if err := add(prefix+"_"+bl.Name+"_st", "the field record of "+bl.Name); err != nil {
 				return err
 			}
 		}
 		for _, fl := range bl.Fields {
-			if fl.Type == schema.Rec && fl.Optional && members["has_"+fl.Name] {
-				return fmt.Errorf("%s:%d: field has_%s collides with the presence flag of %s", f.Name, fl.Line, fl.Name, fl.Name)
+			if cKeywords[fl.Name] {
+				return fmt.Errorf("%s:%d: field name %q is a C keyword", f.Name, fl.Line, fl.Name)
+			}
+			if err := add(cKey(P, bl, fl), "field "+bl.Name+"."+fl.Name); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// cElem is the C type of one list element or single value, as a pointer
-// parameter type ("api_event", "kvp_utf8", "int32_t").
-func cElem(prefix string, fl *schema.Field) string {
-	if fl.Type == schema.Rec {
-		return prefix + "_" + fl.Record.Name
-	}
-	return cTypes[fl.Type].typ
-}
-
-func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
+// cStruct writes the struct of a block and, for a record, the record a
+// field of that type is.
+func cStruct(hw func(string, ...any), prefix string, bl *schema.Block) {
 	name := prefix + "_" + blockName(bl)
-	hasRec := false
-	for _, fl := range bl.Fields {
-		if fl.Type == schema.Rec && !fl.List {
-			hasRec = true
-		}
-	}
-
-	// struct
 	switch bl.Kind {
 	case schema.Command:
 		hw("\n/* Request of command %s (%d). */\n", bl.Name, bl.Number)
@@ -233,128 +268,163 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 	}
 	hw("typedef struct {\n")
 	for _, fl := range bl.Fields {
+		typ := cTypes[fl.Type].st
+		note := ""
+		switch {
+		case fl.List:
+			typ = "kvp_list_st"
+			note = fmt.Sprintf(", list: %s_add_%s, %s_%s", name, fl.Name, name, fl.Name)
+		case fl.Type == schema.Rec:
+			typ = prefix + "_" + fl.Record.Name + "_st"
+		}
+		if fl.Optional {
+			note += ", optional"
+		}
+		if fl.Nullable {
+			note += ", nullable"
+		}
+		if fl.Type == schema.TupleSet {
+			note += ": kvp_tupleset_field..., kvp_tupleset_open"
+		}
+		hw("    %s %s; /* key %d%s */\n", typ, fl.Name, fl.Key, note)
+	}
+	hw("    kvp_span kvp; /* where the message a decoded struct was read from lies */\n")
+	hw("} %s;\n", name)
+	if bl.Kind == schema.Record {
+		hw("\n/* A field of type %s: has says whether an optional one is there. */\n", bl.Name)
+		hw("typedef struct {\n    int null;\n    int has;\n    %s value;\n} %s_st;\n", name, name)
+	}
+}
+
+// cElemOut is the type a list's walk gives each element as.
+func cElemOut(prefix string, fl *schema.Field) string {
+	switch {
+	case fl.Type == schema.Rec:
+		return prefix + "_" + fl.Record.Name
+	case cTypes[fl.Type].plain != "":
+		return cTypes[fl.Type].plain
+	}
+	return cTypes[fl.Type].st
+}
+
+// cAddParam is the parameter one element is added to a list as: a scalar
+// by value, a text or bin by reference to the caller's bytes, a nested
+// message parsed, a record as its struct.
+func cAddParam(prefix string, fl *schema.Field) string {
+	switch fl.Type {
+	case schema.Text:
+		return "const kvp_utf8 *v"
+	case schema.Bin:
+		return "const kvp_bytes *v"
+	case schema.Msg:
+		return "const kvp_message *v"
+	case schema.Rec:
+		return "const " + prefix + "_" + fl.Record.Name + " *v"
+	}
+	return cTypes[fl.Type].plain + " v"
+}
+
+func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
+	name := prefix + "_" + blockName(bl)
+	hasRec, hasField := false, false
+	for _, fl := range bl.Fields {
 		if fl.List {
-			hw("    /* %s: list under key %d, walk it with %s_%s */\n", fl.Name, fl.Key, name, fl.Name)
 			continue
 		}
-		note := ""
-		if fl.Optional {
-			note = ", optional"
-		}
-		hw("    %s %s; /* key %d%s */\n", cElem(prefix, fl), fl.Name, fl.Key, note)
-		if fl.Type == schema.Rec && fl.Optional {
-			hw("    int has_%s; /* 1 when %s is present */\n", fl.Name, fl.Name)
+		hasField = true
+		if fl.Type == schema.Rec {
+			hasRec = true
 		}
 	}
-	hw("    kvp_message kvp; /* the message read from; values point into it */\n")
-	hw("} %s;\n\n", name)
 
 	// prototypes
-	hw("int %s_write(kvp_writer *w, const %s *s);\n", name, name)
-	hw("int %s_encode(const %s *s, void *buf, size_t cap, size_t *len);\n", name, name)
-	hw("int %s_read(const kvp_message *m, %s *s);\n", name, name)
-	hw("int %s_decode(const void *buf, size_t len, %s *s);\n", name, name)
+	hw("\n/* %s */\n", name)
+	hw("void %s_put(kvp_out *o, const kvp_buffer *a, const %s *s);\n", name, name)
+	hw("size_t %s_size(const %s *s, const kvp_buffer *a);\n", name, name)
+	hw("int %s_encode(const %s *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len);\n", name, name)
+	hw("int %s_read(const kvp_buffer *b, const kvp_message *m, %s *s);\n", name, name)
+	hw("int %s_decode(const kvp_buffer *b, %s *s);\n", name, name)
 	for _, fl := range bl.Fields {
 		if !fl.List {
 			continue
 		}
-		hw("int %s_add_%s(kvp_writer *w, %s);\n", name, fl.Name, cAddParam(prefix, fl))
-		if fl.Type == schema.Rec && hasLists(fl.Record) {
-			hw("int %s_begin_%s(kvp_writer *w, kvp_writer *sub, %s);\n", name, fl.Name, cAddParam(prefix, fl))
-		}
-		hw("int %s_%s(const %s *s, kvp_item *it, %s *v);\n", name, fl.Name, name, cElem(prefix, fl))
+		hw("int %s_add_%s(kvp_buffer *a, %s *s, %s);\n", name, fl.Name, name, cAddParam(prefix, fl))
+		hw("int %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v);\n", name, fl.Name, name, cElemOut(prefix, fl))
 	}
 
-	// write
-	cw("\nint %s_write(kvp_writer *w, const %s *s)\n{\n", name, name)
+	// put
+	cw("\nvoid %s_put(kvp_out *o, const kvp_buffer *a, const %s *s)\n{\n", name, name)
 	if hasRec {
-		cw("    kvp_writer sub;\n")
+		cw("    kvp_out sub;\n")
 	}
-	if len(bl.Fields) == 0 || !hasSingle(bl) {
-		cw("    (void)s;\n")
-	}
-	for _, fl := range bl.Fields {
-		if fl.List {
-			continue
-		}
+	cw("    (void)o;\n    (void)a;\n    (void)s;\n")
+	for _, fl := range packOrder(bl) {
 		key := cKey(P, bl, fl)
-		v := "s->" + fl.Name
-		var stmt, cond string
-		switch fl.Type {
-		case schema.Int32:
-			stmt, cond = fmt.Sprintf("kvp_add_int32(w, %s, %s);", key, v), v+" != 0"
-		case schema.Int64:
-			stmt, cond = fmt.Sprintf("kvp_add_int64(w, %s, %s);", key, v), v+" != 0"
-		case schema.TS:
-			stmt, cond = fmt.Sprintf("kvp_add_ts(w, %s, %s);", key, v), v+" != 0"
-		case schema.Bool:
-			stmt, cond = fmt.Sprintf("kvp_add_bool(w, %s, %s);", key, v), v+" != 0"
-		case schema.Float64:
-			stmt, cond = fmt.Sprintf("kvp_add_float64(w, %s, %s);", key, v), v+" != 0"
-		case schema.DS:
-			stmt, cond = fmt.Sprintf("kvp_add_ds(w, %s, %s);", key, v), v+" != 0"
-		case schema.Text:
-			stmt, cond = fmt.Sprintf("kvp_add_utf8(w, %s, &%s);", key, v), v+".len != 0"
-		case schema.Bin:
-			stmt, cond = fmt.Sprintf("kvp_add_bin(w, %s, %s.p, %s.len);", key, v, v), v+".len != 0"
-		case schema.Msg:
-			stmt, cond = fmt.Sprintf("kvp_add_msg(w, %s, %s.buf, %s.len);", key, v, v), v+".buf != NULL"
-		case schema.Rec:
-			stmt = fmt.Sprintf("kvp_begin_msg(w, %s, &sub, %s);\n        %s_%s_write(&sub, &%s);\n        kvp_end_msg(w, &sub);",
-				key, cNum(P, fl.Record), prefix, fl.Record.Name, v)
-			cond = "s->has_" + fl.Name
-		}
-		if fl.Optional || fl.Type == schema.Msg {
-			cw("    if (%s) {\n        %s\n    }\n", cond, stmt)
-		} else {
-			cw("    %s\n", strings.ReplaceAll(stmt, "\n        ", "\n    "))
+		v := "&s->" + fl.Name
+		t := cTypes[fl.Type]
+		switch {
+		case fl.List:
+			cw("    kvp_put_list(o, a, %s, %s, &s->kvp, %s);\n", key, t.kvp, v)
+		case fl.Type == schema.TupleSet:
+			cw("    kvp_put_tupleset(o, a, %s, %s, &s->kvp, %s);\n", key, cFlags(fl), v)
+		case fl.Type == schema.Rec:
+			cw("    if (kvp_put_begin(o, %s, %s, s->%s.null, s->%s.has, &sub, %s)) {\n", key, cFlags(fl), fl.Name, fl.Name, cNum(P, fl.Record))
+			cw("        %s_%s_put(&sub, a, &s->%s.value);\n        kvp_put_end(o, &sub);\n    }\n", prefix, fl.Record.Name, fl.Name)
+		case t.fn == "":
+			cw("    kvp_put_bytes(o, a, %s, %s, %s, %s);\n", key, t.kvp, cFlags(fl), v)
+		default:
+			cw("    kvp_put_%s(o, %s, %s, %s);\n", t.fn, key, cFlags(fl), v)
 		}
 	}
-	cw("    return w->error;\n}\n")
+	cw("}\n")
+
+	// size
+	cw("\nsize_t %s_size(const %s *s, const kvp_buffer *a)\n{\n", name, name)
+	cw("    kvp_out o;\n    kvp_out_measure(&o);\n    %s_put(&o, a, s);\n    return o.size;\n}\n", name)
 
 	// encode
-	cw("\nint %s_encode(const %s *s, void *buf, size_t cap, size_t *len)\n{\n", name, name)
-	cw("    kvp_writer w;\n    kvp_begin(&w, buf, cap, %s);\n    %s_write(&w, s);\n    return kvp_end(&w, len);\n}\n", cNum(P, bl), name)
+	cw("\nint %s_encode(const %s *s, const kvp_buffer *a, void *buf, size_t cap, size_t *len)\n{\n", name, name)
+	cw("    kvp_out o;\n    kvp_out_begin(&o, buf, cap, %s);\n    %s_put(&o, a, s);\n    return kvp_out_end(&o, len);\n}\n", cNum(P, bl), name)
 
 	// read
-	cw("\nint %s_read(const kvp_message *m, %s *s)\n{\n", name, name)
+	cw("\nint %s_read(const kvp_buffer *b, const kvp_message *m, %s *s)\n{\n", name, name)
 	if hasRec {
-		cw("    kvp_message sub;\n    int rc;\n")
+		cw("    kvp_message sub;\n")
 	}
-	cw("    memset(s, 0, sizeof *s);\n    s->kvp = *m;\n")
+	if hasField {
+		cw("    int rc;\n")
+	}
+	cw("    memset(s, 0, sizeof *s);\n    kvp_span_of(b, m, &s->kvp);\n")
 	if bl.Kind == schema.Reply {
 		cw("    if (kvp_is_error(m))\n        return KVP_E_REPLY;\n")
 	}
 	for _, fl := range bl.Fields {
-		if fl.List {
-			continue
-		}
 		key := cKey(P, bl, fl)
-		v := "s->" + fl.Name
-		if fl.Type == schema.Rec {
-			cw("    if (kvp_get_msg(m, %s, &sub) == KVP_OK) {\n", key)
-			cw("        rc = %s_%s_read(&sub, &%s);\n        if (rc != KVP_OK)\n            return rc;\n", prefix, fl.Record.Name, v)
-			if fl.Optional {
-				cw("        s->has_%s = 1;\n    }\n", fl.Name)
-			} else {
-				cw("    } else {\n        return KVP_E_MISSING;\n    }\n")
-			}
+		v := "&s->" + fl.Name
+		t := cTypes[fl.Type]
+		switch {
+		case fl.List:
+			cw("    kvp_read_list(m, %s, %s, %s);\n", key, t.kvp, v)
 			continue
+		case fl.Type == schema.TupleSet:
+			cw("    rc = kvp_read_tupleset(m, %s, %s, %s);\n", key, cFlags(fl), v)
+		case fl.Type == schema.Rec:
+			cw("    rc = kvp_read_rec(m, %s, %s, &s->%s.null, &s->%s.has, &sub);\n", key, cFlags(fl), fl.Name, fl.Name)
+			cw("    if (rc == KVP_OK && s->%s.has)\n        rc = %s_%s_read(b, &sub, &s->%s.value);\n", fl.Name, prefix, fl.Record.Name, fl.Name)
+		case t.fn == "":
+			cw("    rc = kvp_read_bytes(b, m, %s, %s, %s, %s);\n", key, t.kvp, cFlags(fl), v)
+		default:
+			cw("    rc = kvp_read_%s(m, %s, %s, %s);\n", t.fn, key, cFlags(fl), v)
 		}
-		call := cGet(fl, key, v)
-		if fl.Required() {
-			cw("    if (%s != KVP_OK)\n        return KVP_E_MISSING;\n", call)
-		} else {
-			cw("    (void)%s;\n", call)
-		}
+		cw("    if (rc != KVP_OK)\n        return rc;\n")
 	}
 	cw("    return KVP_OK;\n}\n")
 
 	// decode
-	cw("\nint %s_decode(const void *buf, size_t len, %s *s)\n{\n", name, name)
-	cw("    kvp_message m;\n    int rc = kvp_parse(buf, len, &m);\n")
+	cw("\nint %s_decode(const kvp_buffer *b, %s *s)\n{\n", name, name)
+	cw("    kvp_message m;\n    int rc = b ? kvp_parse(b->data, b->size, &m) : KVP_E_ARGUMENT;\n")
 	cw("    if (rc != KVP_OK) {\n        memset(s, 0, sizeof *s);\n        return rc;\n    }\n")
-	cw("    return %s_read(&m, s);\n}\n", name)
+	cw("    return %s_read(b, &m, s);\n}\n", name)
 
 	// lists
 	for _, fl := range bl.Fields {
@@ -362,67 +432,47 @@ func cBlock(hw, cw func(string, ...any), prefix, P string, bl *schema.Block) {
 			continue
 		}
 		key := cKey(P, bl, fl)
-		cw("\nint %s_add_%s(kvp_writer *w, %s)\n{\n", name, fl.Name, cAddParam(prefix, fl))
+		t := cTypes[fl.Type]
+		l := "&s->" + fl.Name
+
+		cw("\nint %s_add_%s(kvp_buffer *a, %s *s, %s)\n{\n", name, fl.Name, name, cAddParam(prefix, fl))
 		switch fl.Type {
-		case schema.Int32:
-			cw("    return kvp_add_int32(w, %s, v);\n", key)
-		case schema.Int64:
-			cw("    return kvp_add_int64(w, %s, v);\n", key)
-		case schema.TS:
-			cw("    return kvp_add_ts(w, %s, v);\n", key)
-		case schema.Bool:
-			cw("    return kvp_add_bool(w, %s, v);\n", key)
-		case schema.Float64:
-			cw("    return kvp_add_float64(w, %s, v);\n", key)
-		case schema.DS:
-			cw("    return kvp_add_ds(w, %s, v);\n", key)
-		case schema.Text:
-			cw("    return kvp_add_utf8(w, %s, v);\n", key)
-		case schema.Bin:
-			cw("    return kvp_add_bin(w, %s, v->p, v->len);\n", key)
+		case schema.Text, schema.Bin:
+			cw("    if (!v)\n        return KVP_E_ARGUMENT;\n")
+			cw("    return kvp_list_add(a, %s, %s, v->p, v->len);\n", l, t.kvp)
 		case schema.Msg:
-			cw("    return kvp_add_msg(w, %s, v->buf, v->len);\n", key)
+			cw("    if (!v || v->len > 0xFFFFFFFFu)\n        return KVP_E_ARGUMENT;\n")
+			cw("    return kvp_list_add(a, %s, KVP_MSG, v->buf, (uint32_t)v->len);\n", l)
 		case schema.Rec:
-			cw("    kvp_writer sub;\n    kvp_begin_msg(w, %s, &sub, %s);\n    %s_%s_write(&sub, v);\n    return kvp_end_msg(w, &sub);\n",
-				key, cNum(P, fl.Record), prefix, fl.Record.Name)
+			rec := prefix + "_" + fl.Record.Name
+			// the element is encoded in place, in a node of the arena
+			cw("    size_t n = %s_size(v, a), len = 0;\n    kvp_off node;\n    int rc;\n", rec)
+			cw("    if (n > 0xFFFFFFFFu)\n        return KVP_E_FULL;\n")
+			cw("    rc = kvp_list_reserve(a, KVP_MSG, (uint32_t)n, &node);\n    if (rc != KVP_OK)\n        return rc;\n")
+			cw("    rc = %s_encode(v, a, kvp_list_value(a, node), n, &len);\n    if (rc != KVP_OK)\n        return rc;\n", rec)
+			cw("    return kvp_list_link(a, %s, node);\n", l)
+		default:
+			cw("    return kvp_list_add_%s(a, %s, v);\n", t.fn, l)
 		}
 		cw("}\n")
-		if fl.Type == schema.Rec && hasLists(fl.Record) {
-			cw("\nint %s_begin_%s(kvp_writer *w, kvp_writer *sub, %s)\n{\n", name, fl.Name, cAddParam(prefix, fl))
-			cw("    kvp_begin_msg(w, %s, sub, %s);\n    return %s_%s_write(sub, v);\n}\n",
-				key, cNum(P, fl.Record), prefix, fl.Record.Name)
-		}
 
-		cw("\nint %s_%s(const %s *s, kvp_item *it, %s *v)\n{\n", name, fl.Name, name, cElem(prefix, fl))
+		cw("\nint %s_%s(const kvp_buffer *b, const %s *s, kvp_item *it, %s *v)\n{\n", name, fl.Name, name, cElemOut(prefix, fl))
+		cw("    kvp_message m;\n")
 		if fl.Type == schema.Rec {
 			cw("    kvp_message sub;\n")
 		}
-		cw("    int rc;\n    for (;;) {\n")
-		cw("        rc = it->value ? kvp_find_next(&s->kvp, it) : kvp_find(&s->kvp, %s, it);\n", key)
+		cw("    int rc = kvp_span_message(b, &s->kvp, &m);\n    if (rc != KVP_OK)\n        return rc;\n")
+		cw("    for (;;) {\n")
+		cw("        rc = it->value ? kvp_find_next(&m, it) : kvp_find(&m, %s, it);\n", key)
 		cw("        if (rc != KVP_OK)\n            return rc;\n")
-		switch fl.Type {
-		case schema.Rec:
-			cw("        if (kvp_msg(it, &sub) == KVP_OK)\n            return %s_%s_read(&sub, v);\n", prefix, fl.Record.Name)
-		case schema.Bin:
-			cw("        if (kvp_bin(it, &v->p, &v->len) == KVP_OK)\n            return KVP_OK;\n")
+		switch {
+		case fl.Type == schema.Rec:
+			cw("        if (kvp_msg(it, &sub) == KVP_OK)\n            return %s_%s_read(b, &sub, v);\n", prefix, fl.Record.Name)
+		case t.fn == "":
+			cw("        if (kvp_read_item(b, it, %s, v) == KVP_OK)\n            return KVP_OK;\n", t.kvp)
 		default:
-			cw("        if (%s(it, v) == KVP_OK)\n            return KVP_OK;\n", cTypes[fl.Type].item)
+			cw("        if (%s(it, v) == KVP_OK)\n            return KVP_OK;\n", t.item)
 		}
 		cw("    }\n}\n")
 	}
-}
-
-func cAddParam(prefix string, fl *schema.Field) string {
-	switch fl.Type {
-	case schema.Int32, schema.Int64, schema.TS, schema.Bool, schema.Float64, schema.DS:
-		return cTypes[fl.Type].typ + " v"
-	}
-	return "const " + cElem(prefix, fl) + " *v"
-}
-
-func cGet(fl *schema.Field, key, v string) string {
-	if fl.Type == schema.Bin {
-		return fmt.Sprintf("kvp_get_bin(m, %s, &%s.p, &%s.len)", key, v, v)
-	}
-	return fmt.Sprintf("%s(m, %s, &%s)", cTypes[fl.Type].get, key, v)
 }

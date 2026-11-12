@@ -10,21 +10,25 @@ import (
 
 // goTypes maps a base type to its Go type, Add method and getter.
 var goTypes = map[string]struct{ typ, add, get, zero string }{
-	schema.Int32:   {"int32", "AddInt32", "Int32", "%s != 0"},
-	schema.Int64:   {"int64", "AddInt64", "Int64", "%s != 0"},
-	schema.TS:      {"time.Time", "AddTime", "Time", "!%s.IsZero()"},
-	schema.Text:    {"string", "AddText", "Text", `%s != ""`},
-	schema.Bin:     {"[]byte", "AddBin", "Bin", "len(%s) != 0"},
-	schema.Msg:     {"*kvpack.Message", "AddMessage", "Message", "%s != nil"},
-	schema.Bool:    {"bool", "AddBool", "Bool", "%s"},
-	schema.Float64: {"float64", "AddFloat64", "Float64", "%s != 0"},
-	schema.DS:      {"time.Time", "AddDate", "Date", "!%s.IsZero()"},
+	schema.Int32:    {"int32", "AddInt32", "Int32", "%s != 0"},
+	schema.Int64:    {"int64", "AddInt64", "Int64", "%s != 0"},
+	schema.TS:       {"time.Time", "AddTime", "Time", "!%s.IsZero()"},
+	schema.Text:     {"string", "AddText", "Text", `%s != ""`},
+	schema.Bin:      {"[]byte", "AddBin", "Bin", "len(%s) != 0"},
+	schema.Msg:      {"*kvpack.Message", "AddMessage", "Message", "%s != nil"},
+	schema.Bool:     {"bool", "AddBool", "Bool", "%s"},
+	schema.Float64:  {"float64", "AddFloat64", "Float64", "%s != 0"},
+	schema.DS:       {"time.Time", "AddDate", "Date", "!%s.IsZero()"},
+	schema.TupleSet: {"*kvpack.TupleSet", "AddTupleSet", "TupleSet", "%s != nil"},
 }
 
 // Go generates a Go file in package pkg: a constant per command and record
 // number, and per block a struct with Pack (struct to message) and Unpack
 // (message to struct).
 func Go(f *schema.File, pkg string) ([]byte, error) {
+	if err := holdsItself(f); err != nil {
+		return nil, err
+	}
 	var b strings.Builder
 	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 
@@ -106,27 +110,54 @@ func goBlock(w func(string, ...any), bl *schema.Block) {
 		} else if fl.Optional {
 			note = ", optional"
 		}
+		if fl.Type == schema.TupleSet {
+			note += ": a tuple definition and its tuples"
+		}
 		w("\t%s %s // key %d%s\n", camel(fl.Name), goFieldType(fl), fl.Key, note)
+		if fl.Nullable && fl.Optional {
+			w("\t%sNull bool // key %d is null: not sent, and what an absent one reads as\n", camel(fl.Name), fl.Key)
+		} else if fl.Nullable {
+			w("\t%sNull bool // key %d arrives, or is sent, as a null\n", camel(fl.Name), fl.Key)
+		}
 	}
 	w("}\n")
 
 	// Pack
-	w("\n// Pack builds the message. Optional fields at their zero value are left out.\n")
+	w("\n// Pack builds the message. Optional fields at their zero value are left out,\n// and what always travels goes as its empty value when left at nil")
+	if hasNullable(bl) {
+		w(";\n// a nullable field whose Null flag is set goes as a null, whatever its value,\n// and is left out when it is optional too")
+	}
+	w(".\n")
 	w("func (s *%s) Pack() *kvpack.Message {\n\tm := kvpack.New(%s)\n", typ, numConst(bl))
 	for _, fl := range packOrder(bl) {
 		v := "s." + camel(fl.Name)
+		if fl.Nullable && fl.Optional {
+			// sent when it is not null, whatever its value
+			w("\tif !%sNull {\n", v)
+			goAdd(w, fl, v)
+			w("\t}\n")
+			continue
+		}
+		if fl.Nullable {
+			w("\tif %sNull {\n\t\tm.AddNull(%d)\n\t} else {\n", v, fl.Key)
+		}
 		switch {
 		case fl.List && fl.Type == schema.Rec:
 			w("\tfor i := range %s {\n\t\tm.AddMessage(%d, %s[i].Pack())\n\t}\n", v, fl.Key, v)
 		case fl.List:
 			w("\tfor _, v := range %s {\n\t\tm.%s(%d, v)\n\t}\n", v, goTypes[fl.Type].add, fl.Key)
-		case fl.Type == schema.Rec:
+		case fl.Optional && fl.Type == schema.Rec:
 			w("\tif %s != nil {\n\t\tm.AddMessage(%d, %s.Pack())\n\t}\n", v, fl.Key, v)
-		case fl.Optional || fl.Type == schema.Msg:
+		case fl.Optional && fl.Type == schema.TupleSet: // no fields is the empty one
+			w("\tif %s != nil && %s.Def != nil && len(%s.Def.Fields) != 0 {\n\t\tm.AddTupleSet(%d, %s)\n\t}\n", v, v, v, fl.Key, v)
+		case fl.Optional:
 			t := goTypes[fl.Type]
 			w("\tif "+t.zero+" {\n\t\tm.%s(%d, %s)\n\t}\n", v, t.add, fl.Key, v)
 		default:
-			w("\tm.%s(%d, %s)\n", goTypes[fl.Type].add, fl.Key, v)
+			goAdd(w, fl, v)
+		}
+		if fl.Nullable {
+			w("\t}\n")
 		}
 	}
 	w("\treturn m\n}\n")
@@ -153,6 +184,21 @@ func goBlock(w func(string, ...any), bl *schema.Block) {
 	for _, fl := range bl.Fields {
 		v := "s." + camel(fl.Name)
 		missing := fmt.Sprintf("errors.New(%q)", name+": missing "+fl.Name)
+		if fl.Nullable && fl.Optional {
+			// absent, a null or another type: null
+			if fl.Type == schema.Rec {
+				w("\tif sub, ok := m.Message(%d); ok {\n", fl.Key)
+				w("\t\t%s = new(%s)\n", v, camel(fl.Record.Name))
+				w("\t\tif err := %s.Unpack(sub); err != nil {\n\t\t\treturn fmt.Errorf(\"%s: %s: %%w\", err)\n\t\t}\n", v, name, fl.Name)
+				w("\t} else {\n\t\t%sNull = true\n\t}\n", v)
+			} else {
+				w("\tif v, ok := m.%s(%d); ok {\n\t\t%s = v\n\t} else {\n\t\t%sNull = true\n\t}\n", goTypes[fl.Type].get, fl.Key, v, v)
+			}
+			continue
+		}
+		if fl.Nullable {
+			w("\tif m.IsNull(%d) {\n\t\t%sNull = true\n\t} else {\n", fl.Key, v)
+		}
 		switch {
 		case fl.List && fl.Type == schema.Rec:
 			w("\tfor _, it := range m.FindAll(%d) {\n", fl.Key)
@@ -176,11 +222,43 @@ func goBlock(w func(string, ...any), bl *schema.Block) {
 		default:
 			w("\t%s, _ = m.%s(%d)\n", v, goTypes[fl.Type].get, fl.Key)
 		}
+		if fl.Nullable {
+			w("\t}\n")
+		}
 	}
 	w("\treturn nil\n}\n")
 }
 
+// goAdd writes a field that always travels. A message, a record or a
+// tupleset left at nil is the empty one: a message of command 0 and no
+// items, a record of empty fields, a definition of no fields.
+func goAdd(w func(string, ...any), fl *schema.Field, v string) {
+	switch fl.Type {
+	case schema.Rec:
+		w("\tif %s != nil {\n\t\tm.AddMessage(%d, %s.Pack())\n\t} else {\n\t\tm.AddMessage(%d, (&%s{}).Pack())\n\t}\n",
+			v, fl.Key, v, fl.Key, camel(fl.Record.Name))
+	case schema.Msg:
+		w("\tif %s != nil {\n\t\tm.AddMessage(%d, %s)\n\t} else {\n\t\tm.AddMessage(%d, kvpack.New(0))\n\t}\n", v, fl.Key, v, fl.Key)
+	case schema.TupleSet:
+		w("\tif %s != nil && %s.Def != nil {\n\t\tm.AddTupleSet(%d, %s)\n\t} else {\n\t\tm.AddTupleSet(%d, kvpack.NewTupleSet(kvpack.NewTupleDef()))\n\t}\n",
+			v, v, fl.Key, v, fl.Key)
+	default:
+		w("\tm.%s(%d, %s)\n", goTypes[fl.Type].add, fl.Key, v)
+	}
+}
+
+// hasNullable reports whether a block declares a nullable field.
+func hasNullable(bl *schema.Block) bool {
+	for _, fl := range bl.Fields {
+		if fl.Nullable {
+			return true
+		}
+	}
+	return false
+}
+
 // needsFmt: record fields wrap the errors of their own Unpack.
+
 func needsFmt(f *schema.File) bool { return hasType(f, schema.Rec) }
 
 // needsErrors: a required field can be missing, a reply can be an error.

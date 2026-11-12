@@ -20,7 +20,7 @@ mkskill:
 | `-go file` | Go code, package `-pkg` |
 | `-pkg name` | Go package name (default: the `.kvp` base name) |
 | `-c file.h` | C header, and the `.c` of the same name next to it |
-| `-hb file.prg` | Harbour functions, and the `.ch` of the same name next to them |
+| `-hb file.prg` | Harbour classes, and the `.ch` of the same name next to them |
 | `-prefix p` | Prefix of the C and Harbour names (default: the `.kvp` base name) |
 
 A file whose content would not change is not rewritten, so builds that

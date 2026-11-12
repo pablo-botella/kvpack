@@ -24,7 +24,7 @@ call "%VSROOT%\VC\Auxiliary\Build\vcvars%ARCH%.bat" >nul
 if errorlevel 1 exit /b 1
 
 cd /d "%~dp0"
-cl /nologo /W4 /WX /O2 /MT /std:c11 /utf-8 /I..\..\..\capi /Fe:test_api.exe ..\..\..\capi\kvpack.c api_kvp.c test_api.c
+cl /nologo /W4 /WX /O2 /MT /std:c11 /utf-8 /I..\..\..\capi /Fe:test_api.exe ..\..\..\capi\kvpack.c ..\..\..\capi\dyn_buffer.c ..\..\..\capi\kvp_arena.c api_kvp.c test_api.c
 set RC=%errorlevel%
 del /q *.obj 2>nul
 if %RC% neq 0 exit /b %RC%

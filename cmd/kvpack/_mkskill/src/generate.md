@@ -18,8 +18,15 @@ required field missing, or present with another type, fails the decode
 (Go: an error naming it; C and Harbour: `KVP_E_MISSING`); a reply carrying
 key 0 is an error reply (Go: the error is its text; C and Harbour:
 `KVP_E_REPLY`); optional fields read as zero when absent and are not
-written when zero; unknown keys are ignored. Single fields are written
-first and lists after them, so the three produce the same bytes.
+written when zero (a tupleset: when it has no fields); a field nobody set
+goes as its empty value, the same bytes in the three languages; an
+`optional nullable` field is not written when null
+and reads null when absent; unknown keys are ignored. Single fields are
+written first and lists after them, so the three produce the same bytes.
+
+The C code is built on `kvp_arena.h` (with `dyn_buffer.h` under it), next
+to `kvpack.h` in `capi/`: compile `kvpack.c`, `dyn_buffer.c` and
+`kvp_arena.c` with the generated `.c`.
 
 What each language gets is described in the
 [kvpack README](https://github.com/pablo-botella/kvpack#declarations-and-generated-code).

@@ -91,6 +91,22 @@ func dump(w io.Writer, bl *schema.Block, m *kvpack.Message, ind string) int {
 		label := fmt.Sprintf("%s%-*s %-6s =%3d  ", ind, width, fl.Name, typeName(fl), fl.Key)
 		items := m.FindAll(fl.Key)
 		want := wantType(fl)
+		if fl.Type == schema.TupleSet {
+			ts, ok := m.TupleSet(fl.Key)
+			switch {
+			case ok:
+				fmt.Fprintf(w, "%s%d fields, %d tuples\n", label, len(ts.Def.Fields), len(ts.Rows))
+				for _, f := range ts.Def.Fields {
+					fmt.Fprintf(w, "%s    %s %s\n", ind, f.Name, f.Type)
+				}
+			case fl.Required():
+				fmt.Fprintf(w, "%sMISSING\n", label)
+				problems++
+			default:
+				fmt.Fprintf(w, "%sabsent (optional)\n", label)
+			}
+			continue
+		}
 		if fl.List {
 			fmt.Fprintf(w, "%s[%d]\n", label, len(items))
 			for i, it := range items {
@@ -107,8 +123,12 @@ func dump(w io.Writer, bl *schema.Block, m *kvpack.Message, ind string) int {
 		case len(items) == 0 && fl.Required():
 			fmt.Fprintf(w, "%sMISSING\n", label)
 			problems++
+		case len(items) == 0 && fl.Nullable:
+			fmt.Fprintf(w, "%sabsent: null (optional nullable)\n", label)
 		case len(items) == 0:
 			fmt.Fprintf(w, "%sabsent (optional)\n", label)
+		case fl.Nullable && items[0].Type == kvpack.Null:
+			fmt.Fprintf(w, "%snull\n", label)
 		case items[0].Type != want:
 			if fl.Required() {
 				fmt.Fprintf(w, "%sMISSING: found %s, not %s\n", label, items[0].Type, want)

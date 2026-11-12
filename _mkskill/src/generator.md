@@ -30,10 +30,36 @@ record event = 100
 One declaration per line, `#` starts a comment, indentation is only for
 the eye. A header — `command name = number`, `reply name` (it takes the
 number of its command) or `record name = number` — opens a block, and the
-fields that follow belong to it: `name type = key [list | optional]`. The
+fields that follow belong to it: `name type = key [list | optional] [nullable]`. The
 types are `int32`, `int64`, `ts`, `text`, `bin`, `bool`, `float64`, `ds`, `msg` (any nested
-message) or the name of a record. Commands and records share names and
-numbers; keys are 1..65535 and unique in their block.
+message), `tupleset` (a tuple definition and its tuples) or the name of a
+record. Commands and records share names and numbers; keys are 1..65535
+and unique in their block.
+
+```
+reply query
+    code      int32    = 1
+    note      text     = 2   nullable            # a text, or a null
+    limit     int32    = 3   optional nullable   # a number, or null and then not sent
+    rows      tupleset = 4                       # shape known only at run time
+```
+
+`optional` and `nullable` are two different things: the first says the key
+may be missing, the second that it may arrive as a `null` instead of a
+value. Between them they decide when a field is written, and what one that
+did not arrive means:
+
+| declared | written | when it does not arrive |
+|---|---|---|
+| (nothing) | always | the decode fails |
+| `optional` | when it is not empty (zero, no bytes) | it reads empty |
+| `nullable` | always, as its value or as a null | the decode fails |
+| `optional nullable` | when it is not null | it reads null |
+
+`optional` leaves out the empty value and `optional nullable` leaves out
+the null, so a field has two states at most. A `tupleset` declares nothing
+about its fields: the definition travels in the message. It takes
+`optional`, not `list` (it already is one) nor `nullable`.
 
 ```sh
 go install github.com/pablo-botella/kvpack/cmd/kvpack@latest
@@ -50,23 +76,41 @@ to the `.kvp` file name. In a Go project it fits a `//go:generate` line.
 required field that is missing, or present with another type, fails the
 decode; that is all. An optional field reads as zero when absent and is not
 written when zero. A list is every item under its key (items of another
-type skipped). Unknown keys are ignored, so a newer side can add fields. A
-reply carrying key 0 decodes as an error reply. Single fields are written
-first and lists after them, so the three write the same bytes.
+type skipped). A null is "another type" unless the field is `nullable`:
+then the decode takes it and says so apart from the value; an `optional
+nullable` field is not written when null and reads null when absent. A
+required `tupleset` needs its definition (no tuples is fine, and so is no
+fields). Unknown keys are ignored, so a newer side can add fields. A reply
+carrying key 0 decodes as an error reply. Single fields are written first
+and lists and tuplesets after them, so the three write the same bytes.
+
+**The empty value.** Every type has one: zero, no bytes, false, the null
+date, a message of command 0 and no items, a record whose fields are all
+empty, a tuple definition of no fields. It is what `optional` leaves out and
+what a field nobody set holds, so a struct that was only created writes
+the same bytes in the three languages: every field that is not optional, as
+its empty value. A Go pointer left at `nil` (a `msg`, a record, a `tupleset`) is
+that empty value; so are a C struct at zero and a new Harbour object. A
+`time.Time` at its zero goes as 0. A record that would always hold itself
+(through fields that are neither optional nor lists) has no empty value and
+is refused.
 
 How each declared type arrives in each language:
 
 | `.kvp` | Go | C | Harbour |
 |---|---|---|---|
-| `int32` / `int64` | `int32` / `int64` | `int32_t` / `int64_t` | numeric |
-| `ts` | `time.Time` | `int64_t` (Unix seconds) | numeric (Unix seconds) |
-| `text` | `string` | `kvp_utf8` | string |
-| `bin` | `[]byte` | `kvp_bytes` | string |
-| `bool` | `bool` | `int` | logical |
-| `float64` | `float64` | `double` | numeric |
-| `ds` | `time.Time` (zero = null date) | `int32_t` `yyyymmdd` (0 = null) | date (empty = null) |
-| `msg` | `*kvpack.Message` | `kvp_message` | handle |
-| record | `*Event` (`[]Event` in a list) | struct by value (+ `has_<f>` when optional) | hash (array of hashes in a list) |
+| `int32` / `int64` | `int32` / `int64` | `kvp_int32_st` / `kvp_int64_st`: `{ null, value }` | numeric |
+| `ts` | `time.Time` | `kvp_ts_st` (Unix seconds) | numeric (Unix seconds) |
+| `text` | `string` | `kvp_text_st`: `{ null, size, off }` | string |
+| `bin` | `[]byte` | `kvp_bin_st` | string |
+| `bool` | `bool` | `kvp_bool_st` | logical |
+| `float64` | `float64` | `kvp_float64_st` | numeric |
+| `ds` | `time.Time` (zero = null date) | `kvp_ds_st`: `yyyymmdd` (0 = null date) | date (empty = null) |
+| `msg` | `*kvpack.Message` | `kvp_msg_st`: the encoded bytes | handle |
+| record | `*Event` (`[]Event` in a list) | `api_event_st`: `{ null, has, value }` | an `ApiEvent` object (an array of them in a list) |
+| a `list` | a slice | `kvp_list_st`, filled and walked through functions | array |
+| `tupleset` | `*kvpack.TupleSet` | `kvp_tupleset_st`, filled and walked through functions | a `KvpTupleSet` object: `aFields` and `aRows` |
+| `nullable` | a `<Field>Null bool` beside the field | the `null` every record has | the value is `NIL` |
 
 **Go** — a constant per number and a struct per block:
 
@@ -79,41 +123,107 @@ if err := reply.Unpack(m); err != nil { ... }   // missing field, or the server'
 for _, e := range reply.Events { ... }
 ```
 
-**C** — `#define`s, a `typedef struct` per block over `kvpack.h`, no
-allocation: text and bin point into the decoded bytes (`kvp_utf8`,
-`kvp_bytes`), a list is walked rather than stored.
+**C** — `#define`s and a `typedef struct` per block, over `kvp_arena.h`.
+The struct has a fixed size and is the caller's; its members are small
+records, the same whatever the field declares: a scalar is `{ null, value }`
+and is assigned directly, and what has no fixed size — a text, a list, the
+tuples of a query — is copied into an **arena** and referred to by offset.
+The arena is a `kvp_buffer` (`dyn_buffer.h`): one block that grows through
+the `malloc` and `free` the application hands in, released whole with one
+call. So a message whose size nobody knows in advance is built piece by
+piece, its exact size asked for, and written into a buffer the caller
+allocates; `kvpack.c` itself still allocates nothing.
 
 ```c
-api_login req = {0};
-req.user = kvp_utf8_of("bob");
-req.password = kvp_utf8_of("secret");
-api_login_encode(&req, buf, sizeof buf, &len);
+kvp_buffer a;
+api_login req;
+kvp_buffer_init(&a, malloc, free, 0, 0);
+memset(&req, 0, sizeof req);                     /* everything empty, nothing null */
+kvp_set_text(&a, &req.user, "bob");
+kvp_set_text(&a, &req.password, "secret");
+req.when.value = time(NULL);
+n = api_login_size(&req, &a);                    /* the exact size */
+buf = malloc(n);
+api_login_encode(&req, &a, buf, n, &len);
+kvp_buffer_free(&a);
+```
 
+Reading copies nothing: the bytes received are the buffer, and the decoded
+struct refers to them.
+
+```c
+kvp_buffer b;
 api_login_reply r;
 kvp_item it = {0};
 api_event ev;
-switch (api_login_reply_decode(bytes, n, &r)) {
+kvp_buffer_wrap(&b, bytes, n);
+switch (api_login_reply_decode(&b, &r)) {
 case KVP_OK:
-    while (api_login_reply_events(&r, &it, &ev) == KVP_OK) { ... }
+    use(kvp_st_ptr(&b, &r.name), r.name.size);
+    while (api_login_reply_events(&b, &r, &it, &ev) == KVP_OK) { ... }
     break;
-case KVP_E_REPLY:                                /* kvp_error_text(&r.kvp, ...) */
+case KVP_E_REPLY:                                /* kvp_span_message(&b, &r.kvp, &m), kvp_error_text(&m, ...) */
     break;
 }
 ```
 
-Lists are written after the struct: `api_x_write(&w, &s)` between
-`kvp_begin` and `kvp_end`, then `api_x_add_<field>(&w, ...)` per element
-(`api_x_begin_<field>` leaves a record element open for its own lists).
+A list takes one element per call, `api_x_add_<field>(&a, &s, v)`, in any
+order with the rest; a record element is a struct of its own, filled (its
+own lists too) before it is added. A tupleset is built straight on its
+member, and read from the message the struct was decoded from:
 
-**Harbour** — functions over a hash keyed by field name; lists are arrays,
-records are hashes:
+```c
+kvp_tupleset_field(&a, &r.rows, KVP_INT32, "id", NULL, 0);
+kvp_tupleset_field(&a, &r.rows, KVP_TEXT, "name", NULL, 0);
+while (next_row()) {                             /* as many as there are */
+    kvp_tupleset_begin(&a, &r.rows);
+    kvp_tupleset_int32(&a, &r.rows, id);
+    kvp_tupleset_null(&a, &r.rows);
+    kvp_tupleset_end(&a, &r.rows);
+}
+
+if (kvp_tupleset_open(&b, &r.kvp, API_QUERY_REPLY_ROWS, &m, &def) == KVP_OK)
+    for (row = def.item; kvp_tuple_next(&m, &row) == KVP_OK; )
+        if (kvp_tuple_field(&def, &row, 0, &f) == KVP_OK) ...   /* f.type is KVP_NULL for a null */
+```
+
+A field is null when its `null` is set (`r.note.null = 1`), and reads the
+same way. An offset stays good when the arena grows; a pointer taken from
+it (`kvp_st_ptr`) does not. A decoded struct can be encoded again with the
+buffer it was decoded from: its lists and tuplesets are written as they
+arrived.
+
+**Harbour** — a class per block, with a variable per field and `Encode()`
+and `Decode()` from the `KvpStruct` they inherit (`capi/kvpclass.prg`). A
+list is an array; a record is an object of its own class, and so is each
+element of a list of records; a nullable field that is null holds `NIL`. A
+new object has its records, messages and tuplesets already there, empty
+and ready to fill; only an optional record or message starts as `NIL`:
 
 ```xbase
-cBytes := ApiLoginEncode( { "user" => "bob", "password" => "secret" } )
-hR := ApiLoginReplyDecode( cReply, @nErr )     // NIL and nErr: KVP_E_MISSING, KVP_E_REPLY...
-FOR EACH hEv IN hR[ "events" ]
-   ? hEv[ "id" ], hEv[ "title" ]
-NEXT
+oReq := ApiLogin():New()
+oReq:user     := "bob"
+oReq:password := "secret"
+cBytes := oReq:Encode()
+
+oR := ApiLoginReply():New()
+IF oR:Decode( cReply, @nErr )                  // .F. and nErr: KVP_E_MISSING, KVP_E_REPLY...
+   FOR EACH oEv IN oR:events                   // ApiEvent objects
+      ? oEv:id, oEv:title, oEv:who:name
+   NEXT
+ENDIF
+```
+
+A tupleset is one class for all of them, `KvpTupleSet`: the fields and a
+two-dimensional array with the tuples.
+
+```xbase
+oR:rows:AddField( "id", KVP_INT32 )              // the tupleset is already there
+oR:rows:AddField( "name", KVP_TEXT, "len=40" ) // name, type and the application's meta
+oR:rows:AddRow( { 1, "Ana" } )
+oR:rows:AddRow( { 2, NIL } )                   // NIL is a null
+
+? oR:rows:aRows[ 2 ][ oR:rows:FieldPos( "name" ) ]
 ```
 
 ---

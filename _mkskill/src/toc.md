@@ -6,6 +6,7 @@ mkskill:
 
 ## Table of contents
 
+- [Why kvpack](#why-kvpack)
 - [Concepts](#concepts)
 - [Quick start](#quick-start)
 - [Go API](#go-api)

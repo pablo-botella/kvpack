@@ -7,3 +7,4 @@
 test_hbkvpack.prg
 kvpack.c
 hbkvpack.c
+kvpclass.prg

@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mkskill>
   <version-spec params="major:byte,minor:[0-99],build:word">
-    <version major="0" minor="0" build="2" lock="major">
-      <ts>2026-11-11T11:15:20Z</ts>
+    <version major="0" minor="0" build="4" lock="major">
+      <ts>2026-11-12T10:49:49Z</ts>
     </version>
-    <label key="title" volatile="true" default-to-ts="true">2026-11-11T11:15:20Z</label>
+    <label key="title" volatile="true" default-to-ts="true">2026-11-12T10:49:49Z</label>
     <create file="__publish.bat" git-ignore="true" eol="crlf">
 @echo off
 set TAG={$$$ version $$$}
@@ -22,13 +22,15 @@ exit /b 1
     <meta>
       <module>github.com/pablo-botella/kvpack</module>
       <license>MIT</license>
-      <description>Tiny binary format that packs the data of a call (request or reply) between Go, C and Harbour programs: a command number plus typed key/value items with a crc32, 20-byte header, no transport, no dependencies, optional code generation from a .kvp declaration. Use when a Go server talks to native clients (C, Harbour, xBase++) over HTTP or a socket and JSON/gRPC are too much. Covers the Go package (build, encode, decode, read from a stream), the wire format, the C and Harbour writer/reader in capi/, and the kvpack command that generates Go, C and Harbour code from a .kvp file. Triggers on kvpack, KVP messages, .kvp files, or &#34;binary request/response between Go and C/Harbour&#34; tasks.</description>
+      <description>Tiny binary format that packs the data of a call (request or reply) between Go, C and Harbour programs: a command number plus typed key/value items with a crc32, 20-byte header, no transport, nothing beyond the standard library of each language, optional code generation from a .kvp declaration. Use when a Go server talks to native clients (C, Harbour, xBase++) over HTTP or a socket, as another alternative to JSON or gRPC. Covers the Go package (build, encode, decode, read from a stream), the wire format, the C and Harbour writer/reader in capi/, and the kvpack command that generates Go, C and Harbour code from a .kvp file. Triggers on kvpack, KVP messages, .kvp files, or &#34;binary request/response between Go and C/Harbour&#34; tasks.</description>
     </meta>
     <child-project id="cli" name="kvpack-cli" path="./cmd/kvpack" project-type="Go-CLI">
       <embed filename="kvpack_generated_embed.go" module-name="main" embed-parent="*" embed-version="{$$$ ver:version $$$}"></embed>
     </child-project>
   </project>
   <version-history max="10">
+    <release version="v0.0.4" ts="2026-11-12T10:49:49Z" title="2026-11-12T10:49:49Z" method="vinc-build"></release>
+    <release version="v0.0.3" ts="2026-11-11T16:43:40Z" title="Added support for dynamic tuples" method="vinc-build"></release>
     <release version="v0.0.2" ts="2026-11-11T11:15:20Z" title="2026-11-11T11:15:20Z" method="vinc-build"></release>
     <release version="v0.0.1" ts="2026-11-11T10:47:47Z" title="2026-11-11T10:47:47Z" method="vset"></release>
     <release version="v0.1.1" ts="2026-11-11T10:47:26Z" title="2026-11-11T10:47:26Z" method="vinc-build"></release>

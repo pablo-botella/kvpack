@@ -16,6 +16,8 @@ const (
 	CmdPing   uint32 = 2
 	RecEvent  uint32 = 100
 	RecPerson uint32 = 101
+	CmdQuery  uint32 = 3
+	CmdEvery  uint32 = 4
 )
 
 // Login is the request of command login (1).
@@ -26,7 +28,8 @@ type Login struct {
 	Tags     []string  // key 4, list
 }
 
-// Pack builds the message. Optional fields at their zero value are left out.
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
 func (s *Login) Pack() *kvpack.Message {
 	m := kvpack.New(CmdLogin)
 	m.AddText(1, s.User)
@@ -69,7 +72,8 @@ type LoginReply struct {
 	Owner   *Person   // key 5, optional
 }
 
-// Pack builds the message. Optional fields at their zero value are left out.
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
 func (s *LoginReply) Pack() *kvpack.Message {
 	m := kvpack.New(CmdLogin)
 	m.AddText(1, s.Name)
@@ -125,7 +129,8 @@ func (s *LoginReply) Unpack(m *kvpack.Message) error {
 type Ping struct {
 }
 
-// Pack builds the message. Optional fields at their zero value are left out.
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
 func (s *Ping) Pack() *kvpack.Message {
 	m := kvpack.New(CmdPing)
 	return m
@@ -152,7 +157,8 @@ type Event struct {
 	Day    time.Time       // key 10, optional
 }
 
-// Pack builds the message. Optional fields at their zero value are left out.
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
 func (s *Event) Pack() *kvpack.Message {
 	m := kvpack.New(RecEvent)
 	m.AddInt32(1, s.ID)
@@ -168,6 +174,8 @@ func (s *Event) Pack() *kvpack.Message {
 	}
 	if s.Who != nil {
 		m.AddMessage(7, s.Who.Pack())
+	} else {
+		m.AddMessage(7, (&Person{}).Pack())
 	}
 	if s.Active {
 		m.AddBool(8, s.Active)
@@ -222,7 +230,8 @@ type Person struct {
 	Name string // key 1
 }
 
-// Pack builds the message. Optional fields at their zero value are left out.
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
 func (s *Person) Pack() *kvpack.Message {
 	m := kvpack.New(RecPerson)
 	m.AddText(1, s.Name)
@@ -237,5 +246,632 @@ func (s *Person) Unpack(m *kvpack.Message) error {
 	if s.Name, ok = m.Text(1); !ok {
 		return errors.New("person: missing name")
 	}
+	return nil
+}
+
+// Query is the request of command query (3).
+type Query struct {
+	Sql string // key 1
+}
+
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil.
+func (s *Query) Pack() *kvpack.Message {
+	m := kvpack.New(CmdQuery)
+	m.AddText(1, s.Sql)
+	return m
+}
+
+// Unpack fills s from m. It fails when a required field is missing or of
+// another type.
+func (s *Query) Unpack(m *kvpack.Message) error {
+	*s = Query{}
+	var ok bool
+	if s.Sql, ok = m.Text(1); !ok {
+		return errors.New("query: missing sql")
+	}
+	return nil
+}
+
+// QueryReply is the reply to command query (3).
+type QueryReply struct {
+	Code       int32            // key 1
+	Note       string           // key 2
+	NoteNull   bool             // key 2 arrives, or is sent, as a null
+	Limit      int32            // key 3, optional
+	LimitNull  bool             // key 3 is null: not sent, and what an absent one reads as
+	Author     *Person          // key 4
+	AuthorNull bool             // key 4 arrives, or is sent, as a null
+	Rows       *kvpack.TupleSet // key 5: a tuple definition and its tuples
+	Extra      *kvpack.TupleSet // key 6, optional: a tuple definition and its tuples
+}
+
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil;
+// a nullable field whose Null flag is set goes as a null, whatever its value,
+// and is left out when it is optional too.
+func (s *QueryReply) Pack() *kvpack.Message {
+	m := kvpack.New(CmdQuery)
+	m.AddInt32(1, s.Code)
+	if s.NoteNull {
+		m.AddNull(2)
+	} else {
+		m.AddText(2, s.Note)
+	}
+	if !s.LimitNull {
+		m.AddInt32(3, s.Limit)
+	}
+	if s.AuthorNull {
+		m.AddNull(4)
+	} else {
+		if s.Author != nil {
+			m.AddMessage(4, s.Author.Pack())
+		} else {
+			m.AddMessage(4, (&Person{}).Pack())
+		}
+	}
+	if s.Rows != nil && s.Rows.Def != nil {
+		m.AddTupleSet(5, s.Rows)
+	} else {
+		m.AddTupleSet(5, kvpack.NewTupleSet(kvpack.NewTupleDef()))
+	}
+	if s.Extra != nil && s.Extra.Def != nil && len(s.Extra.Def.Fields) != 0 {
+		m.AddTupleSet(6, s.Extra)
+	}
+	return m
+}
+
+// Unpack fills s from m. It fails when a required field is missing or of
+// another type, and with the server's text when m is an error reply.
+func (s *QueryReply) Unpack(m *kvpack.Message) error {
+	*s = QueryReply{}
+	if text, bad := m.ErrorText(); bad {
+		return errors.New(text)
+	}
+	var ok bool
+	if s.Code, ok = m.Int32(1); !ok {
+		return errors.New("query_reply: missing code")
+	}
+	if m.IsNull(2) {
+		s.NoteNull = true
+	} else {
+		if s.Note, ok = m.Text(2); !ok {
+			return errors.New("query_reply: missing note")
+		}
+	}
+	if v, ok := m.Int32(3); ok {
+		s.Limit = v
+	} else {
+		s.LimitNull = true
+	}
+	if m.IsNull(4) {
+		s.AuthorNull = true
+	} else {
+		if sub, ok := m.Message(4); ok {
+			s.Author = new(Person)
+			if err := s.Author.Unpack(sub); err != nil {
+				return fmt.Errorf("query_reply: author: %w", err)
+			}
+		} else {
+			return errors.New("query_reply: missing author")
+		}
+	}
+	if s.Rows, ok = m.TupleSet(5); !ok {
+		return errors.New("query_reply: missing rows")
+	}
+	s.Extra, _ = m.TupleSet(6)
+	return nil
+}
+
+// Every is the request of command every (4).
+type Every struct {
+	RInt32        int32             // key 1
+	RInt64        int64             // key 2
+	RTs           time.Time         // key 3
+	RText         string            // key 4
+	RBin          []byte            // key 5
+	RBool         bool              // key 6
+	RFloat64      float64           // key 7
+	RDs           time.Time         // key 8
+	RMsg          *kvpack.Message   // key 9
+	RRec          *Person           // key 10
+	OInt32        int32             // key 11, optional
+	OInt64        int64             // key 12, optional
+	OTs           time.Time         // key 13, optional
+	OText         string            // key 14, optional
+	OBin          []byte            // key 15, optional
+	OBool         bool              // key 16, optional
+	OFloat64      float64           // key 17, optional
+	ODs           time.Time         // key 18, optional
+	OMsg          *kvpack.Message   // key 19, optional
+	ORec          *Person           // key 20, optional
+	NInt32        int32             // key 21
+	NInt32Null    bool              // key 21 arrives, or is sent, as a null
+	NInt64        int64             // key 22
+	NInt64Null    bool              // key 22 arrives, or is sent, as a null
+	NTs           time.Time         // key 23
+	NTsNull       bool              // key 23 arrives, or is sent, as a null
+	NText         string            // key 24
+	NTextNull     bool              // key 24 arrives, or is sent, as a null
+	NBin          []byte            // key 25
+	NBinNull      bool              // key 25 arrives, or is sent, as a null
+	NBool         bool              // key 26
+	NBoolNull     bool              // key 26 arrives, or is sent, as a null
+	NFloat64      float64           // key 27
+	NFloat64Null  bool              // key 27 arrives, or is sent, as a null
+	NDs           time.Time         // key 28
+	NDsNull       bool              // key 28 arrives, or is sent, as a null
+	NMsg          *kvpack.Message   // key 29
+	NMsgNull      bool              // key 29 arrives, or is sent, as a null
+	NRec          *Person           // key 30
+	NRecNull      bool              // key 30 arrives, or is sent, as a null
+	OnInt32       int32             // key 31, optional
+	OnInt32Null   bool              // key 31 is null: not sent, and what an absent one reads as
+	OnInt64       int64             // key 32, optional
+	OnInt64Null   bool              // key 32 is null: not sent, and what an absent one reads as
+	OnTs          time.Time         // key 33, optional
+	OnTsNull      bool              // key 33 is null: not sent, and what an absent one reads as
+	OnText        string            // key 34, optional
+	OnTextNull    bool              // key 34 is null: not sent, and what an absent one reads as
+	OnBin         []byte            // key 35, optional
+	OnBinNull     bool              // key 35 is null: not sent, and what an absent one reads as
+	OnBool        bool              // key 36, optional
+	OnBoolNull    bool              // key 36 is null: not sent, and what an absent one reads as
+	OnFloat64     float64           // key 37, optional
+	OnFloat64Null bool              // key 37 is null: not sent, and what an absent one reads as
+	OnDs          time.Time         // key 38, optional
+	OnDsNull      bool              // key 38 is null: not sent, and what an absent one reads as
+	OnMsg         *kvpack.Message   // key 39, optional
+	OnMsgNull     bool              // key 39 is null: not sent, and what an absent one reads as
+	OnRec         *Person           // key 40, optional
+	OnRecNull     bool              // key 40 is null: not sent, and what an absent one reads as
+	LInt32        []int32           // key 41, list
+	LInt64        []int64           // key 42, list
+	LTs           []time.Time       // key 43, list
+	LText         []string          // key 44, list
+	LBin          [][]byte          // key 45, list
+	LBool         []bool            // key 46, list
+	LFloat64      []float64         // key 47, list
+	LDs           []time.Time       // key 48, list
+	LMsg          []*kvpack.Message // key 49, list
+	LRec          []Person          // key 50, list
+	RSet          *kvpack.TupleSet  // key 51: a tuple definition and its tuples
+	OSet          *kvpack.TupleSet  // key 52, optional: a tuple definition and its tuples
+}
+
+// Pack builds the message. Optional fields at their zero value are left out,
+// and what always travels goes as its empty value when left at nil;
+// a nullable field whose Null flag is set goes as a null, whatever its value,
+// and is left out when it is optional too.
+func (s *Every) Pack() *kvpack.Message {
+	m := kvpack.New(CmdEvery)
+	m.AddInt32(1, s.RInt32)
+	m.AddInt64(2, s.RInt64)
+	m.AddTime(3, s.RTs)
+	m.AddText(4, s.RText)
+	m.AddBin(5, s.RBin)
+	m.AddBool(6, s.RBool)
+	m.AddFloat64(7, s.RFloat64)
+	m.AddDate(8, s.RDs)
+	if s.RMsg != nil {
+		m.AddMessage(9, s.RMsg)
+	} else {
+		m.AddMessage(9, kvpack.New(0))
+	}
+	if s.RRec != nil {
+		m.AddMessage(10, s.RRec.Pack())
+	} else {
+		m.AddMessage(10, (&Person{}).Pack())
+	}
+	if s.OInt32 != 0 {
+		m.AddInt32(11, s.OInt32)
+	}
+	if s.OInt64 != 0 {
+		m.AddInt64(12, s.OInt64)
+	}
+	if !s.OTs.IsZero() {
+		m.AddTime(13, s.OTs)
+	}
+	if s.OText != "" {
+		m.AddText(14, s.OText)
+	}
+	if len(s.OBin) != 0 {
+		m.AddBin(15, s.OBin)
+	}
+	if s.OBool {
+		m.AddBool(16, s.OBool)
+	}
+	if s.OFloat64 != 0 {
+		m.AddFloat64(17, s.OFloat64)
+	}
+	if !s.ODs.IsZero() {
+		m.AddDate(18, s.ODs)
+	}
+	if s.OMsg != nil {
+		m.AddMessage(19, s.OMsg)
+	}
+	if s.ORec != nil {
+		m.AddMessage(20, s.ORec.Pack())
+	}
+	if s.NInt32Null {
+		m.AddNull(21)
+	} else {
+		m.AddInt32(21, s.NInt32)
+	}
+	if s.NInt64Null {
+		m.AddNull(22)
+	} else {
+		m.AddInt64(22, s.NInt64)
+	}
+	if s.NTsNull {
+		m.AddNull(23)
+	} else {
+		m.AddTime(23, s.NTs)
+	}
+	if s.NTextNull {
+		m.AddNull(24)
+	} else {
+		m.AddText(24, s.NText)
+	}
+	if s.NBinNull {
+		m.AddNull(25)
+	} else {
+		m.AddBin(25, s.NBin)
+	}
+	if s.NBoolNull {
+		m.AddNull(26)
+	} else {
+		m.AddBool(26, s.NBool)
+	}
+	if s.NFloat64Null {
+		m.AddNull(27)
+	} else {
+		m.AddFloat64(27, s.NFloat64)
+	}
+	if s.NDsNull {
+		m.AddNull(28)
+	} else {
+		m.AddDate(28, s.NDs)
+	}
+	if s.NMsgNull {
+		m.AddNull(29)
+	} else {
+		if s.NMsg != nil {
+			m.AddMessage(29, s.NMsg)
+		} else {
+			m.AddMessage(29, kvpack.New(0))
+		}
+	}
+	if s.NRecNull {
+		m.AddNull(30)
+	} else {
+		if s.NRec != nil {
+			m.AddMessage(30, s.NRec.Pack())
+		} else {
+			m.AddMessage(30, (&Person{}).Pack())
+		}
+	}
+	if !s.OnInt32Null {
+		m.AddInt32(31, s.OnInt32)
+	}
+	if !s.OnInt64Null {
+		m.AddInt64(32, s.OnInt64)
+	}
+	if !s.OnTsNull {
+		m.AddTime(33, s.OnTs)
+	}
+	if !s.OnTextNull {
+		m.AddText(34, s.OnText)
+	}
+	if !s.OnBinNull {
+		m.AddBin(35, s.OnBin)
+	}
+	if !s.OnBoolNull {
+		m.AddBool(36, s.OnBool)
+	}
+	if !s.OnFloat64Null {
+		m.AddFloat64(37, s.OnFloat64)
+	}
+	if !s.OnDsNull {
+		m.AddDate(38, s.OnDs)
+	}
+	if !s.OnMsgNull {
+		if s.OnMsg != nil {
+			m.AddMessage(39, s.OnMsg)
+		} else {
+			m.AddMessage(39, kvpack.New(0))
+		}
+	}
+	if !s.OnRecNull {
+		if s.OnRec != nil {
+			m.AddMessage(40, s.OnRec.Pack())
+		} else {
+			m.AddMessage(40, (&Person{}).Pack())
+		}
+	}
+	for _, v := range s.LInt32 {
+		m.AddInt32(41, v)
+	}
+	for _, v := range s.LInt64 {
+		m.AddInt64(42, v)
+	}
+	for _, v := range s.LTs {
+		m.AddTime(43, v)
+	}
+	for _, v := range s.LText {
+		m.AddText(44, v)
+	}
+	for _, v := range s.LBin {
+		m.AddBin(45, v)
+	}
+	for _, v := range s.LBool {
+		m.AddBool(46, v)
+	}
+	for _, v := range s.LFloat64 {
+		m.AddFloat64(47, v)
+	}
+	for _, v := range s.LDs {
+		m.AddDate(48, v)
+	}
+	for _, v := range s.LMsg {
+		m.AddMessage(49, v)
+	}
+	for i := range s.LRec {
+		m.AddMessage(50, s.LRec[i].Pack())
+	}
+	if s.RSet != nil && s.RSet.Def != nil {
+		m.AddTupleSet(51, s.RSet)
+	} else {
+		m.AddTupleSet(51, kvpack.NewTupleSet(kvpack.NewTupleDef()))
+	}
+	if s.OSet != nil && s.OSet.Def != nil && len(s.OSet.Def.Fields) != 0 {
+		m.AddTupleSet(52, s.OSet)
+	}
+	return m
+}
+
+// Unpack fills s from m. It fails when a required field is missing or of
+// another type.
+func (s *Every) Unpack(m *kvpack.Message) error {
+	*s = Every{}
+	var ok bool
+	if s.RInt32, ok = m.Int32(1); !ok {
+		return errors.New("every: missing r_int32")
+	}
+	if s.RInt64, ok = m.Int64(2); !ok {
+		return errors.New("every: missing r_int64")
+	}
+	if s.RTs, ok = m.Time(3); !ok {
+		return errors.New("every: missing r_ts")
+	}
+	if s.RText, ok = m.Text(4); !ok {
+		return errors.New("every: missing r_text")
+	}
+	if s.RBin, ok = m.Bin(5); !ok {
+		return errors.New("every: missing r_bin")
+	}
+	if s.RBool, ok = m.Bool(6); !ok {
+		return errors.New("every: missing r_bool")
+	}
+	if s.RFloat64, ok = m.Float64(7); !ok {
+		return errors.New("every: missing r_float64")
+	}
+	if s.RDs, ok = m.Date(8); !ok {
+		return errors.New("every: missing r_ds")
+	}
+	if s.RMsg, ok = m.Message(9); !ok {
+		return errors.New("every: missing r_msg")
+	}
+	if sub, ok := m.Message(10); ok {
+		s.RRec = new(Person)
+		if err := s.RRec.Unpack(sub); err != nil {
+			return fmt.Errorf("every: r_rec: %w", err)
+		}
+	} else {
+		return errors.New("every: missing r_rec")
+	}
+	s.OInt32, _ = m.Int32(11)
+	s.OInt64, _ = m.Int64(12)
+	s.OTs, _ = m.Time(13)
+	s.OText, _ = m.Text(14)
+	s.OBin, _ = m.Bin(15)
+	s.OBool, _ = m.Bool(16)
+	s.OFloat64, _ = m.Float64(17)
+	s.ODs, _ = m.Date(18)
+	s.OMsg, _ = m.Message(19)
+	if sub, ok := m.Message(20); ok {
+		s.ORec = new(Person)
+		if err := s.ORec.Unpack(sub); err != nil {
+			return fmt.Errorf("every: o_rec: %w", err)
+		}
+	}
+	if m.IsNull(21) {
+		s.NInt32Null = true
+	} else {
+		if s.NInt32, ok = m.Int32(21); !ok {
+			return errors.New("every: missing n_int32")
+		}
+	}
+	if m.IsNull(22) {
+		s.NInt64Null = true
+	} else {
+		if s.NInt64, ok = m.Int64(22); !ok {
+			return errors.New("every: missing n_int64")
+		}
+	}
+	if m.IsNull(23) {
+		s.NTsNull = true
+	} else {
+		if s.NTs, ok = m.Time(23); !ok {
+			return errors.New("every: missing n_ts")
+		}
+	}
+	if m.IsNull(24) {
+		s.NTextNull = true
+	} else {
+		if s.NText, ok = m.Text(24); !ok {
+			return errors.New("every: missing n_text")
+		}
+	}
+	if m.IsNull(25) {
+		s.NBinNull = true
+	} else {
+		if s.NBin, ok = m.Bin(25); !ok {
+			return errors.New("every: missing n_bin")
+		}
+	}
+	if m.IsNull(26) {
+		s.NBoolNull = true
+	} else {
+		if s.NBool, ok = m.Bool(26); !ok {
+			return errors.New("every: missing n_bool")
+		}
+	}
+	if m.IsNull(27) {
+		s.NFloat64Null = true
+	} else {
+		if s.NFloat64, ok = m.Float64(27); !ok {
+			return errors.New("every: missing n_float64")
+		}
+	}
+	if m.IsNull(28) {
+		s.NDsNull = true
+	} else {
+		if s.NDs, ok = m.Date(28); !ok {
+			return errors.New("every: missing n_ds")
+		}
+	}
+	if m.IsNull(29) {
+		s.NMsgNull = true
+	} else {
+		if s.NMsg, ok = m.Message(29); !ok {
+			return errors.New("every: missing n_msg")
+		}
+	}
+	if m.IsNull(30) {
+		s.NRecNull = true
+	} else {
+		if sub, ok := m.Message(30); ok {
+			s.NRec = new(Person)
+			if err := s.NRec.Unpack(sub); err != nil {
+				return fmt.Errorf("every: n_rec: %w", err)
+			}
+		} else {
+			return errors.New("every: missing n_rec")
+		}
+	}
+	if v, ok := m.Int32(31); ok {
+		s.OnInt32 = v
+	} else {
+		s.OnInt32Null = true
+	}
+	if v, ok := m.Int64(32); ok {
+		s.OnInt64 = v
+	} else {
+		s.OnInt64Null = true
+	}
+	if v, ok := m.Time(33); ok {
+		s.OnTs = v
+	} else {
+		s.OnTsNull = true
+	}
+	if v, ok := m.Text(34); ok {
+		s.OnText = v
+	} else {
+		s.OnTextNull = true
+	}
+	if v, ok := m.Bin(35); ok {
+		s.OnBin = v
+	} else {
+		s.OnBinNull = true
+	}
+	if v, ok := m.Bool(36); ok {
+		s.OnBool = v
+	} else {
+		s.OnBoolNull = true
+	}
+	if v, ok := m.Float64(37); ok {
+		s.OnFloat64 = v
+	} else {
+		s.OnFloat64Null = true
+	}
+	if v, ok := m.Date(38); ok {
+		s.OnDs = v
+	} else {
+		s.OnDsNull = true
+	}
+	if v, ok := m.Message(39); ok {
+		s.OnMsg = v
+	} else {
+		s.OnMsgNull = true
+	}
+	if sub, ok := m.Message(40); ok {
+		s.OnRec = new(Person)
+		if err := s.OnRec.Unpack(sub); err != nil {
+			return fmt.Errorf("every: on_rec: %w", err)
+		}
+	} else {
+		s.OnRecNull = true
+	}
+	for _, it := range m.FindAll(41) {
+		if v, ok := it.Int32(); ok {
+			s.LInt32 = append(s.LInt32, v)
+		}
+	}
+	for _, it := range m.FindAll(42) {
+		if v, ok := it.Int64(); ok {
+			s.LInt64 = append(s.LInt64, v)
+		}
+	}
+	for _, it := range m.FindAll(43) {
+		if v, ok := it.Time(); ok {
+			s.LTs = append(s.LTs, v)
+		}
+	}
+	for _, it := range m.FindAll(44) {
+		if v, ok := it.Text(); ok {
+			s.LText = append(s.LText, v)
+		}
+	}
+	for _, it := range m.FindAll(45) {
+		if v, ok := it.Bin(); ok {
+			s.LBin = append(s.LBin, v)
+		}
+	}
+	for _, it := range m.FindAll(46) {
+		if v, ok := it.Bool(); ok {
+			s.LBool = append(s.LBool, v)
+		}
+	}
+	for _, it := range m.FindAll(47) {
+		if v, ok := it.Float64(); ok {
+			s.LFloat64 = append(s.LFloat64, v)
+		}
+	}
+	for _, it := range m.FindAll(48) {
+		if v, ok := it.Date(); ok {
+			s.LDs = append(s.LDs, v)
+		}
+	}
+	for _, it := range m.FindAll(49) {
+		if v, ok := it.Message(); ok {
+			s.LMsg = append(s.LMsg, v)
+		}
+	}
+	for _, it := range m.FindAll(50) {
+		sub, ok := it.Message()
+		if !ok {
+			continue
+		}
+		var r Person
+		if err := r.Unpack(sub); err != nil {
+			return fmt.Errorf("every: l_rec: %w", err)
+		}
+		s.LRec = append(s.LRec, r)
+	}
+	if s.RSet, ok = m.TupleSet(51); !ok {
+		return errors.New("every: missing r_set")
+	}
+	s.OSet, _ = m.TupleSet(52)
 	return nil
 }

@@ -3,6 +3,7 @@ package kvpgen_test
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -161,6 +162,12 @@ func TestParseErrors(t *testing.T) {
 		{"command a = 1\n x thing = 1", "unknown type"},
 		{"command a = 1\n x text = 1 list optional", "already optional"},
 		{"command a = 1\n x text = 1 maybe", "unknown modifier"},
+		{"command a = 1\n x text = 1 list nullable", "cannot be nullable"},
+		{"command a = 1\n x tupleset = 1 list", "already a list"},
+		{"command a = 1\n x tupleset = 1 nullable", "cannot be nullable"},
+		{"command a = 1\n x text = 1 nullable\n x_null bool = 2", "collides with the null flag"},
+		{"command tupleset = 1", "the name is a type"},
+
 		{"reply a", "no command a"},
 		{"command a = 1\nreply a\nreply a", "already declared"},
 		{"command Login = 1", "lowercase"},
@@ -187,5 +194,525 @@ func TestCErrors(t *testing.T) {
 	f, _ = schema.Parse("t.kvp", strings.NewReader("command a = 1\n int int32 = 1"))
 	if _, _, err := gen.C(f, "t", "t.h"); err == nil || !strings.Contains(err.Error(), "C keyword") {
 		t.Errorf("keyword: %v", err)
+	}
+}
+
+// canonicalQueryHex is the query reply the three generated codes must write
+// and read: a nullable field sent as a null, an optional nullable one that
+// is null and so left out, a record, and a tupleset (id int32, name text)
+// with the tuples 1, "Ana" and 2, null.
+const canonicalQueryHex = "4b5650010300000006000000930000000704f72e01000100040000000700000002000a0000000000040006001e0000004b56500165000000010000000a000000e6db35f00100040002000000646905000b001e000000020000000100020000006964000000000400040000006e616d650000000005000c001300000001000400000001000000040003000000416e6105000c0010000000010004000000020000000a0000000000"
+
+func canonicalQuery() api.QueryReply {
+	rows := kvpack.NewTupleSet(kvpack.NewTupleDef().Field("id", kvpack.Int32).Field("name", kvpack.Text))
+	rows.Add(int32(1), "Ana")
+	rows.Add(int32(2), nil)
+	return api.QueryReply{Code: 7, NoteNull: true, LimitNull: true, Author: &api.Person{Name: "di"}, Rows: rows}
+}
+
+func TestCanonicalQuery(t *testing.T) {
+	r := canonicalQuery()
+	got := hex.EncodeToString(r.Pack().Encode())
+	if got != canonicalQueryHex {
+		t.Fatalf("encoding differs:\n got %s\nwant %s", got, canonicalQueryHex)
+	}
+	b, _ := hex.DecodeString(canonicalQueryHex)
+	m, err := kvpack.Decode(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back api.QueryReply
+	if err := back.Unpack(m); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back, r) {
+		t.Fatalf("round trip:\n got %+v\nwant %+v", back, r)
+	}
+}
+
+func TestNullable(t *testing.T) {
+	rows := kvpack.NewTupleSet(kvpack.NewTupleDef().Field("n", kvpack.Int32))
+	base := func() *kvpack.Message { return kvpack.New(api.CmdQuery).AddInt32(1, 0) }
+	person := kvpack.New(api.RecPerson).AddText(1, "di")
+
+	// a value where a null may come; an optional nullable that does not
+	// arrive reads null
+	var r api.QueryReply
+	if err := r.Unpack(base().AddText(2, "hi").AddMessage(4, person).AddTupleSet(5, rows)); err != nil {
+		t.Fatal(err)
+	}
+	if r.Note != "hi" || r.NoteNull || !r.LimitNull || r.Limit != 0 || r.AuthorNull || r.Author.Name != "di" {
+		t.Errorf("%+v", r)
+	}
+	// and one that arrives, even as a zero, is not null
+	if err := r.Unpack(base().AddText(2, "").AddInt32(3, 0).AddMessage(4, person).AddTupleSet(5, rows)); err != nil {
+		t.Fatal(err)
+	}
+	if r.NoteNull || r.LimitNull || r.Limit != 0 {
+		t.Errorf("%+v", r)
+	}
+	if r.Rows == nil || len(r.Rows.Def.Fields) != 1 || len(r.Rows.Rows) != 0 || r.Extra != nil {
+		t.Errorf("tuplesets: %+v %+v", r.Rows, r.Extra)
+	}
+	// nulls everywhere they may come
+	if err := r.Unpack(base().AddNull(2).AddNull(3).AddNull(4).AddTupleSet(5, rows).AddTupleSet(6, rows)); err != nil {
+		t.Fatal(err)
+	}
+	if !r.NoteNull || !r.LimitNull || !r.AuthorNull || r.Author != nil || r.Extra == nil {
+		t.Errorf("%+v", r)
+	}
+	// the Null flag wins over the value; an optional nullable is left out
+	// when null and written when not, whatever its value
+	m := (&api.QueryReply{Note: "ignored", NoteNull: true, Limit: 5, LimitNull: true, AuthorNull: true, Rows: rows}).Pack()
+	if !m.IsNull(2) || m.Find(3) != nil || !m.IsNull(4) {
+		t.Errorf("%+v", m.Items)
+	}
+	m = (&api.QueryReply{Rows: rows}).Pack()
+	if v, ok := m.Int32(3); !ok || v != 0 {
+		t.Errorf("an optional nullable at zero is not null: %+v", m.Items)
+	}
+	if v, ok := m.Text(2); !ok || v != "" || m.IsNull(2) {
+		t.Errorf("a nullable at zero is an empty value: %+v", m.Items)
+	}
+	// what is not nullable still refuses a null, and a required one must come
+	for name, c := range map[string]struct {
+		m    *kvpack.Message
+		want string
+	}{
+		"null code":    {kvpack.New(api.CmdQuery).AddNull(1).AddNull(2).AddNull(4).AddTupleSet(5, rows), "query_reply: missing code"},
+		"note absent":  {base().AddNull(4).AddTupleSet(5, rows), "query_reply: missing note"},
+		"rows absent":  {base().AddNull(2).AddNull(4), "query_reply: missing rows"},
+		"rows is text": {base().AddNull(2).AddNull(4).AddText(5, "x"), "query_reply: missing rows"},
+	} {
+		if err := r.Unpack(c.m); err == nil || err.Error() != c.want {
+			t.Errorf("%s: %v, want %q", name, err, c.want)
+		}
+	}
+}
+
+// Command every declares each type in each form a field can take: required
+// (r_), optional (o_), nullable (n_), optional nullable (on_) and list (l_),
+// plus a required and an optional tupleset. Three messages of it are pinned,
+// the same in the C and Harbour tests:
+//
+//	full   every field with a value, two elements per list, a tupleset with
+//	       a field of each type, one tuple with values and one all null
+//	zeros  what a struct nobody touched writes, the same in the three
+//	       languages: every field that always travels as its empty value (a
+//	       zero, no bytes, a message of command 0 and no items, a record of
+//	       empty fields, a tuple definition of no fields), nothing of the
+//	       optional fields nor the lists
+//	nulls  the same with every field that can be null set to null: the
+//	       nullable ones go as nulls, the optional nullable ones are left out
+const (
+	everyFullHex  = "4b56500104000000400000003b0500007860084f0100010004000000ffffffff02000200080000000000000000010000030003000800000000f153650000000004000400040000007465787405000500030000000001ff060007000100000001070008000800000000000000000004400800090008000000323032363131313209000600140000004b565001090000000000000000000000000000000a0006001d0000004b5650016500000001000000090000005e1d56860100040001000000720b000100040000000b0000000c000200080000000c000000000000000d000300080000000df15365000000000e000400010000006f0f000500010000000f100007000100000001110008000800000000000000008031401200090008000000323032363031313813000600140000004b56500113000000000000000000000000000000140006001d0000004b565001650000000100000009000000877150e501000400010000006f15000100040000001500000016000200080000001600000000000000170003000800000017f153650000000018000400010000006e1900050001000000191a00070001000000011b000800080000000000000000803b401c0009000800000032303236303132381d000600140000004b5650011d0000000000000000000000000000001e0006001d0000004b5650016500000001000000090000001141579201000400010000006e1f000100040000001f00000020000200080000002000000000000000210003000800000021f153650000000022000400020000006f6e23000500010000002324000700010000000125000800080000000000000000c042402600090008000000323032363032313827000600140000004b56500127000000000000000000000000000000280006001e0000004b56500165000000010000000a0000008e97a58d01000400020000006f6e2900010004000000010000002900010004000000feffffff2a0002000800000003000000000000002a00020008000000fcffffffffffffff2b000300080000002bf15365000000002b0003000800000000000000000000002c00040001000000612c000400000000002d0005000200000001022d000500000000002e00070001000000012e00070001000000002f00080008000000000000000000e03f2f00080008000000000000000000f8bf300009000800000032303236303130313000090008000000202020202020202031000600140000004b5650010100000000000000000000000000000031000600140000004b56500102000000000000000000000000000000320006001d0000004b56500165000000010000000900000040f48366010004000100000078320006001d0000004b565001650000000100000009000000d6c4841101000400010000007933000b006d0000000900000001000100000069000000000200010000006a00000000030001000000740000000004000100000073060000006c656e3d343005000100000062000000000600010000006d000000000700010000006b000000000800010000006600000000090001000000640000000033000c007300000001000400000001000000020008000000020000000000000003000800000003f1536500000000040003000000416e61050001000000040600140000004b56500105000000000000000000000000000000070001000000010800080000000000000000001a40090008000000323032363037303733000c00360000000a00000000000a00000000000a00000000000a00000000000a00000000000a00000000000a00000000000a00000000000a000000000034000b000f000000010000000100010000006e00000000"
+	everyNullsHex = "4b565001040000001500000001010000ecb25ee1010001000400000000000000020002000800000000000000000000000300030008000000000000000000000004000400000000000500050000000000060007000100000000070008000800000000000000000000000800090008000000202020202020202009000600140000004b565001000000000000000000000000000000000a0006001c0000004b565001650000000100000008000000e19d1932010004000000000015000a000000000016000a000000000017000a000000000018000a000000000019000a00000000001a000a00000000001b000a00000000001c000a00000000001d000a00000000001e000a000000000033000b000400000000000000"
+	everyZerosHex = "4b565001040000001f000000fb010000d3e7d1a4010001000400000000000000020002000800000000000000000000000300030008000000000000000000000004000400000000000500050000000000060007000100000000070008000800000000000000000000000800090008000000202020202020202009000600140000004b565001000000000000000000000000000000000a0006001c0000004b565001650000000100000008000000e19d193201000400000000001500010004000000000000001600020008000000000000000000000017000300080000000000000000000000180004000000000019000500000000001a00070001000000001b0008000800000000000000000000001c0009000800000020202020202020201d000600140000004b565001000000000000000000000000000000001e0006001c0000004b565001650000000100000008000000e19d193201000400000000001f0001000400000000000000200002000800000000000000000000002100030008000000000000000000000022000400000000002300050000000000240007000100000000250008000800000000000000000000002600090008000000202020202020202027000600140000004b56500100000000000000000000000000000000280006001c0000004b565001650000000100000008000000e19d1932010004000000000033000b000400000000000000"
+)
+
+func ts(sec int64) time.Time { return time.Unix(sec, 0).UTC() }
+
+func day(y, m, d int) time.Time { return time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC) }
+
+func everyFull() api.Every {
+	set := kvpack.NewTupleSet(kvpack.NewTupleDef().
+		Field("i", kvpack.Int32).Field("j", kvpack.Int64).Field("t", kvpack.Time).
+		FieldMeta("s", kvpack.Text, []byte("len=40")).Field("b", kvpack.Bin).Field("m", kvpack.Msg).
+		Field("k", kvpack.Bool).Field("f", kvpack.Float64).Field("d", kvpack.Date))
+	set.Add(int32(1), int64(2), ts(1700000003), "Ana", []byte{4}, kvpack.New(5), true, 6.5, day(2026, 7, 7))
+	set.Add(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	return api.Every{
+		RInt32: -1, RInt64: 1 << 40, RTs: ts(1700000000), RText: "text", RBin: []byte{0, 1, 255},
+		RBool: true, RFloat64: 2.5, RDs: day(2026, 11, 12), RMsg: kvpack.New(9), RRec: &api.Person{Name: "r"},
+
+		OInt32: 11, OInt64: 12, OTs: ts(1700000013), OText: "o", OBin: []byte{15},
+		OBool: true, OFloat64: 17.5, ODs: day(2026, 1, 18), OMsg: kvpack.New(19), ORec: &api.Person{Name: "o"},
+
+		NInt32: 21, NInt64: 22, NTs: ts(1700000023), NText: "n", NBin: []byte{25},
+		NBool: true, NFloat64: 27.5, NDs: day(2026, 1, 28), NMsg: kvpack.New(29), NRec: &api.Person{Name: "n"},
+
+		OnInt32: 31, OnInt64: 32, OnTs: ts(1700000033), OnText: "on", OnBin: []byte{35},
+		OnBool: true, OnFloat64: 37.5, OnDs: day(2026, 2, 18), OnMsg: kvpack.New(39), OnRec: &api.Person{Name: "on"},
+
+		LInt32: []int32{1, -2}, LInt64: []int64{3, -4}, LTs: []time.Time{ts(1700000043), ts(0)},
+		LText: []string{"a", ""}, LBin: [][]byte{{1, 2}, {}}, LBool: []bool{true, false},
+		LFloat64: []float64{0.5, -1.5}, LDs: []time.Time{day(2026, 1, 1), {}},
+		LMsg: []*kvpack.Message{kvpack.New(1), kvpack.New(2)}, LRec: []api.Person{{Name: "x"}, {Name: "y"}},
+
+		RSet: set,
+		OSet: kvpack.NewTupleSet(kvpack.NewTupleDef().Field("n", kvpack.Int32)),
+	}
+}
+
+// everyZeros is a struct nobody touched: nothing null, everything empty.
+func everyZeros() api.Every {
+	return api.Every{}
+}
+
+// everyNulls is everyZeros with every field that can be null set to null.
+func everyNulls() api.Every {
+	e := everyZeros()
+	e.NInt32Null, e.NInt64Null, e.NTsNull, e.NTextNull, e.NBinNull = true, true, true, true, true
+	e.NBoolNull, e.NFloat64Null, e.NDsNull, e.NMsgNull, e.NRecNull = true, true, true, true, true
+	e.OnInt32Null, e.OnInt64Null, e.OnTsNull, e.OnTextNull, e.OnBinNull = true, true, true, true, true
+	e.OnBoolNull, e.OnFloat64Null, e.OnDsNull, e.OnMsgNull, e.OnRecNull = true, true, true, true, true
+	return e
+}
+
+// keysOf lists the keys of a message, in order, a null as its negative.
+func keysOf(m *kvpack.Message) []int {
+	var keys []int
+	for i := range m.Items {
+		if m.Items[i].Type == kvpack.Null {
+			keys = append(keys, -int(m.Items[i].Key))
+		} else {
+			keys = append(keys, int(m.Items[i].Key))
+		}
+	}
+	return keys
+}
+
+func span(from, to int) []int {
+	var keys []int
+	for k := from; k <= to; k++ {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestEveryCanonical(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		e    api.Every
+		hex  string
+	}{{"full", everyFull(), everyFullHex}, {"nulls", everyNulls(), everyNullsHex}, {"zeros", everyZeros(), everyZerosHex}} {
+		got := hex.EncodeToString(c.e.Pack().Encode())
+		if got != c.hex {
+			t.Errorf("%s: encoding differs:\n got %s\nwant %s", c.name, got, c.hex)
+			continue
+		}
+		// what is read writes the same bytes again
+		m, err := kvpack.Decode(c.e.Pack().Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back api.Every
+		if err := back.Unpack(m); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if again := hex.EncodeToString(back.Pack().Encode()); again != c.hex {
+			t.Errorf("%s: round trip differs:\n got %s\nwant %s", c.name, again, c.hex)
+		}
+	}
+}
+
+// TestEveryWritten says which keys each message carries: the rule of each
+// form, seen on the wire.
+func TestEveryWritten(t *testing.T) {
+	e := everyFull()
+	var want []int
+	want = append(want, span(1, 40)...)
+	for k := 41; k <= 50; k++ { // two elements per list
+		want = append(want, k, k)
+	}
+	want = append(want, 51, 51, 51, 52) // a definition and two tuples; a definition
+	if got := keysOf(e.Pack()); !reflect.DeepEqual(got, want) {
+		t.Errorf("full: %v", got)
+	}
+
+	// nulls: the required fields, the nullable ones as nulls, and nothing
+	// of the optional, the optional nullable nor the lists
+	e = everyNulls()
+	want = span(1, 10)
+	for k := 21; k <= 30; k++ {
+		want = append(want, -k)
+	}
+	want = append(want, 51)
+	if got := keysOf(e.Pack()); !reflect.DeepEqual(got, want) {
+		t.Errorf("nulls: %v", got)
+	}
+
+	// zeros: an optional field at zero is left out; a nullable one and an
+	// optional nullable one at zero are values, and travel
+	e = everyZeros()
+	want = append(append(span(1, 10), span(21, 40)...), 51)
+	if got := keysOf(e.Pack()); !reflect.DeepEqual(got, want) {
+		t.Errorf("zeros: %v", got)
+	}
+
+	// the same message with everything that always travels given by hand,
+	// as its empty value: a nil and the empty value are one thing
+	e = api.Every{
+		RTs: ts(0), RMsg: kvpack.New(0), RRec: &api.Person{},
+		NTs: ts(0), NMsg: kvpack.New(0), NRec: &api.Person{},
+		OnTs: ts(0), OnMsg: kvpack.New(0), OnRec: &api.Person{},
+		RSet: kvpack.NewTupleSet(kvpack.NewTupleDef()),
+		OSet: kvpack.NewTupleSet(kvpack.NewTupleDef()), // optional and of no fields: left out
+	}
+	if got := hex.EncodeToString(e.Pack().Encode()); got != everyZerosHex {
+		t.Errorf("zeros by hand:\n got %s\nwant %s", got, everyZerosHex)
+	}
+}
+
+// TestEveryRead reads the three messages and looks at every field.
+func TestEveryRead(t *testing.T) {
+	read := func(e api.Every) api.Every {
+		t.Helper()
+		m, err := kvpack.Decode(e.Pack().Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back api.Every
+		if err := back.Unpack(m); err != nil {
+			t.Fatal(err)
+		}
+		return back
+	}
+
+	e := read(everyFull())
+	if e.RInt32 != -1 || e.RInt64 != 1<<40 || !e.RTs.Equal(ts(1700000000)) || e.RText != "text" ||
+		!bytes.Equal(e.RBin, []byte{0, 1, 255}) || !e.RBool || e.RFloat64 != 2.5 || !e.RDs.Equal(day(2026, 11, 12)) ||
+		e.RMsg == nil || e.RMsg.Command != 9 || e.RRec == nil || e.RRec.Name != "r" {
+		t.Errorf("full, required: %+v", e)
+	}
+	if e.OInt32 != 11 || e.OInt64 != 12 || !e.OTs.Equal(ts(1700000013)) || e.OText != "o" ||
+		!bytes.Equal(e.OBin, []byte{15}) || !e.OBool || e.OFloat64 != 17.5 || !e.ODs.Equal(day(2026, 1, 18)) ||
+		e.OMsg == nil || e.OMsg.Command != 19 || e.ORec == nil || e.ORec.Name != "o" {
+		t.Errorf("full, optional: %+v", e)
+	}
+	if e.NInt32 != 21 || e.NInt64 != 22 || !e.NTs.Equal(ts(1700000023)) || e.NText != "n" ||
+		!bytes.Equal(e.NBin, []byte{25}) || !e.NBool || e.NFloat64 != 27.5 || !e.NDs.Equal(day(2026, 1, 28)) ||
+		e.NMsg == nil || e.NMsg.Command != 29 || e.NRec == nil || e.NRec.Name != "n" {
+		t.Errorf("full, nullable: %+v", e)
+	}
+	if e.NInt32Null || e.NInt64Null || e.NTsNull || e.NTextNull || e.NBinNull ||
+		e.NBoolNull || e.NFloat64Null || e.NDsNull || e.NMsgNull || e.NRecNull {
+		t.Errorf("full, nullable: a value read as null: %+v", e)
+	}
+	if e.OnInt32 != 31 || e.OnInt64 != 32 || !e.OnTs.Equal(ts(1700000033)) || e.OnText != "on" ||
+		!bytes.Equal(e.OnBin, []byte{35}) || !e.OnBool || e.OnFloat64 != 37.5 || !e.OnDs.Equal(day(2026, 2, 18)) ||
+		e.OnMsg == nil || e.OnMsg.Command != 39 || e.OnRec == nil || e.OnRec.Name != "on" {
+		t.Errorf("full, optional nullable: %+v", e)
+	}
+	if e.OnInt32Null || e.OnInt64Null || e.OnTsNull || e.OnTextNull || e.OnBinNull ||
+		e.OnBoolNull || e.OnFloat64Null || e.OnDsNull || e.OnMsgNull || e.OnRecNull {
+		t.Errorf("full, optional nullable: a value read as null: %+v", e)
+	}
+	if !reflect.DeepEqual(e.LInt32, []int32{1, -2}) || !reflect.DeepEqual(e.LInt64, []int64{3, -4}) ||
+		len(e.LTs) != 2 || !e.LTs[0].Equal(ts(1700000043)) || !e.LTs[1].Equal(ts(0)) ||
+		!reflect.DeepEqual(e.LText, []string{"a", ""}) ||
+		len(e.LBin) != 2 || !bytes.Equal(e.LBin[0], []byte{1, 2}) || len(e.LBin[1]) != 0 ||
+		!reflect.DeepEqual(e.LBool, []bool{true, false}) || !reflect.DeepEqual(e.LFloat64, []float64{0.5, -1.5}) ||
+		len(e.LDs) != 2 || !e.LDs[0].Equal(day(2026, 1, 1)) || !e.LDs[1].IsZero() ||
+		len(e.LMsg) != 2 || e.LMsg[0].Command != 1 || e.LMsg[1].Command != 2 ||
+		!reflect.DeepEqual(e.LRec, []api.Person{{Name: "x"}, {Name: "y"}}) {
+		t.Errorf("full, lists: %+v", e)
+	}
+	if e.RSet == nil || len(e.RSet.Def.Fields) != 9 || len(e.RSet.Rows) != 2 ||
+		e.RSet.Def.Fields[3].Name != "s" || string(e.RSet.Def.Fields[3].Meta) != "len=40" {
+		t.Fatalf("full, r_set: %+v", e.RSet)
+	}
+	row := e.RSet.Rows[0]
+	if row[0] != int32(1) || row[1] != int64(2) || !row[2].(time.Time).Equal(ts(1700000003)) || row[3] != "Ana" ||
+		!bytes.Equal(row[4].([]byte), []byte{4}) || row[5].(*kvpack.Message).Command != 5 ||
+		row[6] != true || row[7] != 6.5 || !row[8].(time.Time).Equal(day(2026, 7, 7)) {
+		t.Errorf("full, r_set, the tuple with values: %+v", row)
+	}
+	for i, v := range e.RSet.Rows[1] {
+		if v != nil {
+			t.Errorf("full, r_set, the null tuple: field %d is %v", i, v)
+		}
+	}
+	if e.OSet == nil || len(e.OSet.Def.Fields) != 1 || len(e.OSet.Rows) != 0 {
+		t.Errorf("full, o_set: %+v", e.OSet)
+	}
+
+	// nulls: an optional field that did not arrive reads empty; a nullable
+	// one that came as a null and an optional nullable one that did not
+	// arrive read null
+	e = read(everyNulls())
+	if e.RInt32 != 0 || e.RInt64 != 0 || !e.RTs.Equal(ts(0)) || e.RText != "" || len(e.RBin) != 0 ||
+		e.RBool || e.RFloat64 != 0 || !e.RDs.IsZero() || e.RMsg == nil || e.RRec == nil || e.RRec.Name != "" {
+		t.Errorf("nulls, required: %+v", e)
+	}
+	if e.OInt32 != 0 || e.OInt64 != 0 || !e.OTs.IsZero() || e.OText != "" || len(e.OBin) != 0 ||
+		e.OBool || e.OFloat64 != 0 || !e.ODs.IsZero() || e.OMsg != nil || e.ORec != nil {
+		t.Errorf("nulls, optional: %+v", e)
+	}
+	if !e.NInt32Null || !e.NInt64Null || !e.NTsNull || !e.NTextNull || !e.NBinNull ||
+		!e.NBoolNull || !e.NFloat64Null || !e.NDsNull || !e.NMsgNull || !e.NRecNull || e.NMsg != nil || e.NRec != nil {
+		t.Errorf("nulls, nullable: %+v", e)
+	}
+	if !e.OnInt32Null || !e.OnInt64Null || !e.OnTsNull || !e.OnTextNull || !e.OnBinNull ||
+		!e.OnBoolNull || !e.OnFloat64Null || !e.OnDsNull || !e.OnMsgNull || !e.OnRecNull || e.OnMsg != nil || e.OnRec != nil {
+		t.Errorf("nulls, optional nullable: %+v", e)
+	}
+	if e.LInt32 != nil || e.LInt64 != nil || e.LTs != nil || e.LText != nil || e.LBin != nil ||
+		e.LBool != nil || e.LFloat64 != nil || e.LDs != nil || e.LMsg != nil || e.LRec != nil {
+		t.Errorf("nulls, lists: %+v", e)
+	}
+	if e.RSet == nil || len(e.RSet.Rows) != 0 || e.OSet != nil {
+		t.Errorf("nulls, tuplesets: %+v %+v", e.RSet, e.OSet)
+	}
+
+	// zeros: a zero that arrives is a value, not a null
+	e = read(everyZeros())
+	if e.NInt32Null || e.NInt64Null || e.NTsNull || e.NTextNull || e.NBinNull ||
+		e.NBoolNull || e.NFloat64Null || e.NDsNull || e.NMsgNull || e.NRecNull || e.NMsg == nil || e.NRec == nil {
+		t.Errorf("zeros, nullable: %+v", e)
+	}
+	if e.OnInt32Null || e.OnInt64Null || e.OnTsNull || e.OnTextNull || e.OnBinNull ||
+		e.OnBoolNull || e.OnFloat64Null || e.OnDsNull || e.OnMsgNull || e.OnRecNull || e.OnMsg == nil || e.OnRec == nil {
+		t.Errorf("zeros, optional nullable: %+v", e)
+	}
+	if e.NInt32 != 0 || e.NText != "" || e.NBool || !e.NTs.Equal(ts(0)) || !e.NDs.IsZero() ||
+		e.OnInt32 != 0 || e.OnText != "" || e.OnBool || !e.OnTs.Equal(ts(0)) || !e.OnDs.IsZero() {
+		t.Errorf("zeros, values: %+v", e)
+	}
+}
+
+// How TestEveryKeyByKey changes one key of the full message.
+const (
+	dropKey  = iota // the key does not arrive
+	nullKey         // it arrives as a null
+	otherKey        // it arrives with another type
+)
+
+// change returns m with the items of key dropped, or the first of them
+// replaced by a null or by a value of another type.
+func change(m *kvpack.Message, key uint16, how int) *kvpack.Message {
+	out := kvpack.New(m.Command)
+	done := false
+	for i := range m.Items {
+		it := m.Items[i]
+		if it.Key != key {
+			out.Items = append(out.Items, it)
+			continue
+		}
+		if !done && how == nullKey {
+			out.AddNull(key)
+		}
+		if !done && how == otherKey {
+			if it.Type == kvpack.Text {
+				out.AddInt32(key, 1)
+			} else {
+				out.AddText(key, "x")
+			}
+		}
+		done = true
+	}
+	return out
+}
+
+// TestEveryKeyByKey takes the full message and, key by key, drops it, sends
+// it as a null and sends it with another type: per form, whether the
+// message is still read and what the field then holds, seen by packing
+// again what was read (empty or null and optional: not written; null:
+// written as a null).
+func TestEveryKeyByKey(t *testing.T) {
+	const (
+		fails  = iota // the message is refused
+		empty         // read, and the field is not written again
+		isNull        // read, and the field is written again as a null
+	)
+	// per form, what happens when its key is dropped, null, of another type
+	forms := []struct {
+		name     string
+		from, to uint16
+		want     [3]int
+	}{
+		{"required", 1, 10, [3]int{fails, fails, fails}},
+		{"optional", 11, 20, [3]int{empty, empty, empty}},
+		{"nullable", 21, 30, [3]int{fails, isNull, fails}},
+		{"optional nullable", 31, 40, [3]int{empty, empty, empty}}, // it reads null, and that null is not written
+		{"list", 41, 50, [3]int{empty, empty, empty}},
+		{"tupleset", 51, 51, [3]int{fails, fails, fails}},
+		{"optional tupleset", 52, 52, [3]int{empty, empty, empty}},
+	}
+	how := []string{"dropped", "null", "of another type"}
+	e := everyFull()
+	full := e.Pack()
+	for _, f := range forms {
+		for key := f.from; key <= f.to; key++ {
+			for h, want := range f.want {
+				var back api.Every
+				err := back.Unpack(change(full, key, h))
+				name := fmt.Sprintf("%s, key %d %s", f.name, key, how[h])
+				if want == fails {
+					if err == nil || !strings.Contains(err.Error(), "every: missing ") {
+						t.Errorf("%s: read, want it refused (%v)", name, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Errorf("%s: %v", name, err)
+					continue
+				}
+				again := back.Pack()
+				if want == empty && again.Find(key) != nil {
+					t.Errorf("%s: the field holds something: %+v", name, again.Find(key))
+				}
+				if want == isNull && !again.IsNull(key) {
+					t.Errorf("%s: the field is not null: %+v", name, again.Find(key))
+				}
+				// the null of an optional nullable field is there to see
+				if f.name == "optional nullable" && !reflect.ValueOf(back).FieldByName(onNull[key-31]).Bool() {
+					t.Errorf("%s: %s is not set", name, onNull[key-31])
+				}
+			}
+		}
+	}
+}
+
+var onNull = []string{"OnInt32Null", "OnInt64Null", "OnTsNull", "OnTextNull", "OnBinNull",
+	"OnBoolNull", "OnFloat64Null", "OnDsNull", "OnMsgNull", "OnRecNull"}
+
+// A record that always holds itself has no empty value: its own would hold
+// another, without end. Go and Harbour refuse it (C refuses any record that
+// contains itself other than in a list).
+func TestHoldsItself(t *testing.T) {
+	for src, bad := range map[string]bool{
+		"record a = 1\n next a = 1":                                         true,
+		"record a = 1\n next a = 1 nullable":                                true,
+		"record a = 1\n b b = 1\nrecord b = 2\n a a = 1 optional nullable":  true,
+		"record a = 1\n next a = 1 optional":                                false,
+		"record a = 1\n next a = 1 list":                                    false,
+		"record a = 1\n b b = 1\nrecord b = 2\n a a = 1 optional\n c c = 2": true,
+	} {
+		if strings.Contains(src, "c c = 2") {
+			src += "\nrecord c = 3\n b b = 1"
+		}
+		f, err := schema.Parse("t.kvp", strings.NewReader(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, errGo := gen.Go(f, "t")
+		_, _, errHb := gen.Harbour(f, "t", "t.ch")
+		for lang, err := range map[string]error{"Go": errGo, "Harbour": errHb} {
+			if bad && (err == nil || !strings.Contains(err.Error(), "always holds itself")) {
+				t.Errorf("%s, %q: %v, want it refused", lang, src, err)
+			}
+			if !bad && err != nil {
+				t.Errorf("%s, %q: %v", lang, src, err)
+			}
+		}
+	}
+}
+
+// The zero Time is no moment: it travels as 0, what C and Harbour write for
+// a ts nobody set, in an item and in a tuple.
+func TestZeroTime(t *testing.T) {
+	set := kvpack.NewTupleSet(kvpack.NewTupleDef().Field("t", kvpack.Time))
+	set.Add(time.Time{})
+	m, err := kvpack.Decode(kvpack.New(1).AddTime(1, time.Time{}).AddTupleSet(2, set).Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := m.Time(1); !ok || !v.Equal(ts(0)) {
+		t.Errorf("item: %v", v)
+	}
+	back, ok := m.TupleSet(2)
+	if !ok || len(back.Rows) != 1 || !back.Rows[0][0].(time.Time).Equal(ts(0)) {
+		t.Errorf("tuple: %+v", back)
 	}
 }

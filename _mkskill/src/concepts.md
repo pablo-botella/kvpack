@@ -11,7 +11,8 @@ mkskill:
 | **Message** | One unit on the wire: a 20-byte header (command, item count, data size, crc32) and the items. The same shape serves as request and as reply. |
 | **Command** | A `uint32` the application assigns: *what* is asked (`login`, `clock-in`) or, in a nested message, *what kind of record* this is. The format gives it no meaning. |
 | **Item** | A key (`uint16`), a type (`uint16`) and a value. Keys are the application's; a key may repeat, which is how a list travels. |
-| **Type** | `int32` (4 bytes), `int64` (8), `ts` (8: Unix seconds, UTC), `text` (UTF-8, no terminator), `bin` (raw), `msg` (a whole message nested as the value), `bool` (1), `float64` (8, IEEE 754) or `ds` (8: a day as `yyyymmdd`, Harbour's `DToS`). |
+| **Type** | `int32` (4 bytes), `int64` (8), `ts` (8: Unix seconds, UTC), `text` (UTF-8, no terminator), `bin` (raw), `msg` (a whole message nested as the value), `bool` (1), `float64` (8, IEEE 754), `ds` (8: a day as `yyyymmdd`, Harbour's `DToS`) `null` (0: the key is present and has no value), or the pair `tupledef` / `tuple`. |
+| **Tuples** | A structure declared on the fly and then repeated: under one key a `tupledef` (per field its type, its name and a meta that is the application's) and right after it zero or more `tuple` items, each with one value per field, or null. |
 | **Error reply** | A reply whose key 0 holds a text. `NewError` builds one, `ErrorText` reads it; a transport status (HTTP, say) stays at success because the message is the protocol. |
 | **Canonical message** | A fixed message whose bytes are pinned in the Go, C and Harbour tests, so the three implementations are proven to agree byte for byte. |
 

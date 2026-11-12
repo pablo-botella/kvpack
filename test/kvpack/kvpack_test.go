@@ -373,9 +373,270 @@ func TestNewTypesValues(t *testing.T) {
 	}
 }
 
+// canonical3Hex is the third reference encoding shared with the C and
+// Harbour tests: the null type. Command 9: int32 7 (key 1), null (2), an
+// empty text (3) -- a null is neither a zero nor an empty value.
+const canonical3Hex = "4b56500109000000030000001c000000a2ae13ae01000100040000000700000002000a00000000000300040000000000"
+
+func TestCanonical3(t *testing.T) {
+	enc := kvpack.New(9).AddInt32(1, 7).AddNull(2).AddText(3, "").Encode()
+	if got := hex.EncodeToString(enc); got != canonical3Hex {
+		t.Fatalf("encoding differs:\n got %s\nwant %s", got, canonical3Hex)
+	}
+	base, _ := hex.DecodeString(canonical3Hex)
+	m, err := kvpack.Decode(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.IsNull(2) || !m.Find(2).IsNull() || m.Find(2).Type != kvpack.Null {
+		t.Error("key 2 is not a null")
+	}
+	if m.IsNull(1) || m.IsNull(3) {
+		t.Error("a value read as null")
+	}
+	if m.IsNull(9) {
+		t.Error("an absent key read as null")
+	}
+	// the typed getters do not reinterpret a null
+	if _, ok := m.Int32(2); ok {
+		t.Error("a null read as int32")
+	}
+	if _, ok := m.Text(2); ok {
+		t.Error("a null read as text")
+	}
+	if v, ok := m.Text(3); !ok || v != "" {
+		t.Error("the empty text")
+	}
+	// a null carries no value: size 1 is refused (the size of key 2 is at 36;
+	// the byte it claims is taken from the next item, so nitems drops to 2)
+	b := append([]byte(nil), base...)
+	b[36] = 8
+	b[8] = 2
+	if _, err := kvpack.Decode(reseal(b)); !errors.Is(err, kvpack.ErrFormat) {
+		t.Errorf("null with a value: %v", err)
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("raw null with a value: no panic")
+			}
+		}()
+		kvpack.New(1).Add(1, kvpack.Null, []byte{0})
+	}()
+}
+
+// canonical4Hex is the fourth reference encoding shared with the C and
+// Harbour tests: tuples. Command 10. Under key 1 a definition (id int32,
+// name text with meta "len=40", born ds) and two tuples: 1, "Ana",
+// 1980-01-15 and 2, "Luis", null. Under key 2 a definition (n int64) with
+// no tuples.
+const canonical4Hex = "4b5650010a000000040000009c000000f158c35d01000b0032000000030000000100020000006964000000000400040000006e616d65060000006c656e3d3430090004000000626f726e0000000001000c002100000001000400000001000000040003000000416e61090008000000313938303031313501000c001a000000010004000000020000000400040000004c7569730a000000000002000b000f000000010000000200010000006e00000000"
+
+func canonical4Def() *kvpack.TupleDef {
+	return kvpack.NewTupleDef().Field("id", kvpack.Int32).FieldMeta("name", kvpack.Text, []byte("len=40")).Field("born", kvpack.Date)
+}
+
+func TestCanonical4(t *testing.T) {
+	born := time.Date(1980, 1, 15, 0, 0, 0, 0, time.UTC)
+	ts := kvpack.NewTupleSet(canonical4Def())
+	if err := ts.Add(int32(1), "Ana", born); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.Add(2, "Luis", nil); err != nil { // an int for an int32, nil for null
+		t.Fatal(err)
+	}
+	empty := kvpack.NewTupleSet(kvpack.NewTupleDef().Field("n", kvpack.Int64))
+	enc := kvpack.New(10).AddTupleSet(1, ts).AddTupleSet(2, empty).Encode()
+	if got := hex.EncodeToString(enc); got != canonical4Hex {
+		t.Fatalf("encoding differs:\n got %s\nwant %s", got, canonical4Hex)
+	}
+
+	base, _ := hex.DecodeString(canonical4Hex)
+	m, err := kvpack.Decode(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := m.TupleSet(1)
+	if !ok {
+		t.Fatal("no tuples under key 1")
+	}
+	f := got.Def.Fields
+	if len(f) != 3 || f[0].Name != "id" || f[0].Type != kvpack.Int32 || len(f[0].Meta) != 0 ||
+		f[1].Name != "name" || f[1].Type != kvpack.Text || string(f[1].Meta) != "len=40" ||
+		f[2].Name != "born" || f[2].Type != kvpack.Date {
+		t.Errorf("definition: %+v", f)
+	}
+	want := [][]any{{int32(1), "Ana", born}, {int32(2), "Luis", nil}}
+	if len(got.Rows) != 2 {
+		t.Fatalf("rows: %d", len(got.Rows))
+	}
+	for i, row := range got.Rows {
+		for j, v := range row {
+			if v != want[i][j] {
+				t.Errorf("row %d field %s: %v, want %v", i, f[j].Name, v, want[i][j])
+			}
+		}
+	}
+	if e, ok := m.TupleSet(2); !ok || len(e.Def.Fields) != 1 || len(e.Rows) != 0 {
+		t.Error("the definition with no tuples")
+	}
+	if _, ok := m.TupleSet(9); ok {
+		t.Error("tuples under an absent key")
+	}
+	if d, ok := m.Find(1).TupleDef(); !ok || len(d.Fields) != 3 {
+		t.Error("Item.TupleDef")
+	}
+	if len(m.FindAll(1)) != 3 || m.FindAll(1)[1].Type != kvpack.Tup {
+		t.Error("the definition and its two tuples share the key")
+	}
+}
+
+func TestTupleValues(t *testing.T) {
+	// every field type, and a null in each position
+	def := kvpack.NewTupleDef().Field("a", kvpack.Int32).Field("b", kvpack.Int64).Field("c", kvpack.Time).
+		Field("d", kvpack.Text).Field("e", kvpack.Bin).Field("f", kvpack.Msg).Field("g", kvpack.Bool).
+		Field("h", kvpack.Float64).Field("i", kvpack.Date)
+	when := time.Unix(1700000000, 0).UTC()
+	day := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
+	ts := kvpack.NewTupleSet(def)
+	if err := ts.Add(int32(-2), int64(1234567890123), when, "", []byte{0, 0xff}, kvpack.New(5).AddInt32(1, 3), true, 1.5, day); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.Add(nil, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	m, err := kvpack.Decode(kvpack.New(1).AddTupleSet(7, ts).Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.TupleSet(7)
+	r := got.Rows[0]
+	if r[0] != int32(-2) || r[1] != int64(1234567890123) || r[2] != when || r[3] != "" || r[6] != true || r[7] != 1.5 || r[8] != day {
+		t.Errorf("values: %v", r)
+	}
+	if b, ok := r[4].([]byte); !ok || len(b) != 2 || b[1] != 0xff {
+		t.Errorf("bin: %v", r[4])
+	}
+	if sub, ok := r[5].(*kvpack.Message); !ok || sub.Command != 5 {
+		t.Errorf("msg: %v", r[5])
+	}
+	for i, v := range got.Rows[1] {
+		if v != nil {
+			t.Errorf("field %d of the null tuple: %v", i, v)
+		}
+	}
+
+	// values that do not fit the definition are refused, nothing is added
+	small := kvpack.NewTupleSet(kvpack.NewTupleDef().Field("n", kvpack.Int32).Field("s", kvpack.Text))
+	for name, row := range map[string][]any{
+		"too few":       {int32(1)},
+		"too many":      {int32(1), "a", "b"},
+		"text as int32": {"x", "a"},
+		"int32 as text": {int32(1), int32(2)},
+		"int too big":   {1 << 40, "a"},
+	} {
+		if err := small.Add(row...); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if len(small.Rows) != 0 {
+		t.Error("a refused tuple was added")
+	}
+
+	// a definition a decoder would refuse cannot be built
+	for name, f := range map[string]func(){
+		"no name":       func() { kvpack.NewTupleDef().Field("", kvpack.Int32) },
+		"repeated name": func() { kvpack.NewTupleDef().Field("a", kvpack.Int32).Field("a", kvpack.Text) },
+		"null field":    func() { kvpack.NewTupleDef().Field("a", kvpack.Null) },
+		"tuple field":   func() { kvpack.NewTupleDef().Field("a", kvpack.Tup) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: no panic", name)
+				}
+			}()
+			f()
+		}()
+	}
+}
+
+func TestTupleOrder(t *testing.T) {
+	def := kvpack.NewTupleDef().Field("n", kvpack.Int32).Field("s", kvpack.Text)
+	row, err := def.EncodeRow(int32(1), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := def.Encode()
+	raw := func(key uint16, ty kvpack.Type, v []byte) func(*kvpack.Message) {
+		return func(m *kvpack.Message) { m.Add(key, ty, v) }
+	}
+	defOf := func(f func(d *kvpack.TupleDef)) []byte { // a definition no builder lets through
+		x := &kvpack.TupleDef{Fields: []kvpack.TupleField{{Name: "n", Type: kvpack.Int32}, {Name: "s", Type: kvpack.Text}}}
+		f(x)
+		return x.Encode()
+	}
+	good := [][]func(*kvpack.Message){
+		{raw(1, kvpack.TupDef, d)},
+		{raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, row), raw(1, kvpack.Tup, row)},
+		{raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, row), raw(2, kvpack.TupDef, d), raw(2, kvpack.Tup, row)},
+		{raw(1, kvpack.TupDef, d), raw(5, kvpack.Int32, []byte{1, 0, 0, 0})},
+	}
+	bad := map[string][]func(*kvpack.Message){
+		"tuple with no definition":        {raw(1, kvpack.Tup, row)},
+		"tuple under another key":         {raw(1, kvpack.TupDef, d), raw(2, kvpack.Tup, row)},
+		"an item in between":              {raw(1, kvpack.TupDef, d), raw(5, kvpack.Int32, []byte{1, 0, 0, 0}), raw(1, kvpack.Tup, row)},
+		"tuple after another definition":  {raw(1, kvpack.TupDef, d), raw(2, kvpack.TupDef, d), raw(1, kvpack.Tup, row)},
+		"two definitions under one key":   {raw(1, kvpack.TupDef, d), raw(1, kvpack.TupDef, d)},
+		"a second one further on":         {raw(1, kvpack.TupDef, d), raw(2, kvpack.TupDef, d), raw(1, kvpack.TupDef, d)},
+		"tuple one field short":           {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, row[:10])},
+		"tuple with bytes left over":      {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, append(append([]byte(nil), row...), 0))},
+		"int32 field of 3 bytes":          {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, []byte{1, 0, 3, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0, 0})},
+		"field size past the end":         {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, []byte{1, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 9, 0, 0, 0, 'a'})},
+		"field of another type":           {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, []byte{4, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 1, 0, 0, 0, 'a'})},
+		"null with a value":               {raw(1, kvpack.TupDef, d), raw(1, kvpack.Tup, []byte{10, 0, 1, 0, 0, 0, 0, 4, 0, 1, 0, 0, 0, 'a'})},
+		"definition cut short":            {raw(1, kvpack.TupDef, d[:len(d)-1])},
+		"definition with bytes left over": {raw(1, kvpack.TupDef, append(append([]byte(nil), d...), 0))},
+		"definition shorter than a count": {raw(1, kvpack.TupDef, []byte{0, 0})},
+		"field with no name":              {raw(1, kvpack.TupDef, defOf(func(x *kvpack.TupleDef) { x.Fields[1].Name = "" }))},
+		"repeated field name":             {raw(1, kvpack.TupDef, defOf(func(x *kvpack.TupleDef) { x.Fields[1].Name = "n" }))},
+		"null as a field type":            {raw(1, kvpack.TupDef, defOf(func(x *kvpack.TupleDef) { x.Fields[1].Type = kvpack.Null }))},
+		"tuple as a field type":           {raw(1, kvpack.TupDef, defOf(func(x *kvpack.TupleDef) { x.Fields[1].Type = kvpack.Tup }))},
+	}
+	build := func(steps []func(*kvpack.Message)) []byte {
+		m := kvpack.New(1)
+		for _, s := range steps {
+			s(m)
+		}
+		return m.Encode()
+	}
+	for i, steps := range good {
+		if _, err := kvpack.Decode(build(steps)); err != nil {
+			t.Errorf("good %d: %v", i, err)
+		}
+	}
+	for name, steps := range bad {
+		if _, err := kvpack.Decode(build(steps)); !errors.Is(err, kvpack.ErrFormat) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	// a bool field is still 0 or 1, and a nested message must decode
+	bdef := kvpack.NewTupleDef().Field("b", kvpack.Bool).Field("m", kvpack.Msg)
+	for name, row := range map[string][]byte{
+		"bool 2":      {7, 0, 1, 0, 0, 0, 2, 10, 0, 0, 0, 0, 0},
+		"msg of junk": {10, 0, 0, 0, 0, 0, 6, 0, 4, 0, 0, 0, 'j', 'u', 'n', 'k'},
+	} {
+		b := kvpack.New(1).Add(1, kvpack.TupDef, bdef.Encode()).Add(1, kvpack.Tup, row).Encode()
+		if _, err := kvpack.Decode(b); !errors.Is(err, kvpack.ErrFormat) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestTypeString(t *testing.T) {
 	want := map[kvpack.Type]string{kvpack.Int32: "int32", kvpack.Int64: "int64", kvpack.Time: "ts", kvpack.Text: "text", kvpack.Bin: "bin",
-		kvpack.Msg: "msg", kvpack.Bool: "bool", kvpack.Float64: "float64", kvpack.Date: "ds", kvpack.Type(99): "type(99)"}
+		kvpack.Msg: "msg", kvpack.Bool: "bool", kvpack.Float64: "float64", kvpack.Date: "ds", kvpack.Null: "null", kvpack.TupDef: "tupledef", kvpack.Tup: "tuple", kvpack.Type(99): "type(99)"}
 	for ty, s := range want {
 		if ty.String() != s {
 			t.Errorf("%d: %q", ty, ty.String())
